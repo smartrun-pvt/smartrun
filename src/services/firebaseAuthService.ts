@@ -260,11 +260,11 @@ export function formatFirebasePhoneError(err: any): FirebaseDiagnostic {
       return {
         code,
         userMessage:
-          'Unable to verify Android app identity with Firebase (Play Integrity / SHA-256 mismatch). Add this build keystore SHA-1 & SHA-256 in Firebase Console.',
+          'Unable to verify Android app identity with Firebase (Play Integrity & reCAPTCHA check failed). For sideloaded APKs, ensure Chrome is enabled, upload keystore SHA-1 & SHA-256 are registered in Firebase Console with a fresh google-services.json, or install via Play Internal Testing.',
         technicalCause:
-          'Play Integrity verification failed and the reCAPTCHA fallback could not validate this APK signature.',
+          rawMsg || 'Play Integrity verification failed (expected on sideloaded APKs outside Google Play) and the Chrome Custom Tab reCAPTCHA fallback did not complete.',
         resolution:
-          '1. Register your debug & release SHA-1 and SHA-256 fingerprints in Firebase Project Settings -> Android app (in.smartrun.app).\n2. Ensure www.smartrun.in is added to Firebase Authorized Domains and Play Integrity API is enabled in Google Cloud.'
+          '1. Register your exact signing keystore SHA-1 & SHA-256 in Firebase Console -> Project Settings -> Android app (in.smartrun.app) and download a fresh google-services.json.\n2. Ensure Chrome Custom Tabs are enabled and /__/auth/* is not intercepted by App Links.\n3. For silent Play Integrity verification, install via Google Play Internal Testing.'
       };
 
     case 'auth/invalid-app-credential':
@@ -320,9 +320,12 @@ export function formatFirebasePhoneError(err: any): FirebaseDiagnostic {
     case 'auth/too-many-requests':
       return {
         code,
-        userMessage: 'Firebase Error (auth/too-many-requests): Temporarily blocked due to too many requests.',
-        technicalCause: 'Firebase anti-abuse rate limit was triggered for this device or number.',
-        resolution: 'Wait a few minutes before retrying, or verify your Play Integrity and SHA-256 app signing configuration in Firebase Console.'
+        userMessage:
+          'Firebase Error (auth/too-many-requests): Temporarily blocked by Firebase anti-abuse protection (repeated attempts or failed app verification). Please wait a while before retrying.',
+        technicalCause:
+          rawMsg || 'Firebase anti-abuse rate limit was triggered for this device or phone number (failed Play Integrity / reCAPTCHA attempts also count toward this block even if no SMS was sent).',
+        resolution:
+          'Wait 1–4 hours before retrying this number/device, or add a test phone number in Firebase Console -> Authentication -> Sign-in method -> Phone -> Phone numbers for testing.'
       };
 
     case 'auth/invalid-phone-number':

@@ -42,6 +42,10 @@ import {
   decodeBase64UrlToUtf8,
   resolveWebAuthnRpConfig
 } from "./src/utils/passkeyHelper";
+import {
+  resolveAuthoritativeOrderItems,
+  verifyRazorpayOrderPaymentStatus
+} from "./src/utils/orderSecurity";
 
 dotenv.config();
 
@@ -2143,8 +2147,8 @@ const OrderItemSchema = z.object({
   product: z
     .object({
       id: z.string().min(1),
-      name: z.string().min(1),
-      price: z.number().nonnegative(),
+      name: z.string().min(1).optional().default("Electrical Item"),
+      price: z.number().nonnegative().optional().default(0),
       brand: z.string().optional(),
       unit: z.string().optional(),
       image: z.string().optional(),
@@ -2172,8 +2176,8 @@ const OrderCheckoutSchema = z.object({
   pincode: z.string().regex(/^7\d{5}$/, "Please provide a valid 6-digit Kolkata PIN code (e.g. 700039)"),
   landmark: z.string().max(200).optional().nullable(),
   items: z.array(OrderItemSchema).min(1, "Order must contain at least 1 item"),
-  itemTotal: z.number().nonnegative("Item total must be positive"),
-  deliveryFee: z.number().nonnegative("Delivery fee cannot be negative"),
+  itemTotal: z.number().nonnegative("Item total must be positive").optional().default(0),
+  deliveryFee: z.number().nonnegative("Delivery fee cannot be negative").optional().default(0),
   handlingFee: z.number().nonnegative().optional().default(0),
   rainFee: z.number().nonnegative().optional().default(0),
   surgeFee: z.number().nonnegative().optional().default(0),
@@ -2181,7 +2185,7 @@ const OrderCheckoutSchema = z.object({
   fees: z.number().nonnegative().optional().default(0),
   feeBreakdown: z.any().optional().nullable(),
   discount: z.number().nonnegative().optional().default(0),
-  totalAmount: z.number().nonnegative("Total amount must be positive"),
+  totalAmount: z.number().nonnegative("Total amount must be positive").optional().default(0),
   paymentMethod: z.enum(["cod", "upi", "card"]).default("cod"),
   paymentStatus: z.enum(["paid", "pending"]).default("pending"),
   paymentId: z.string().optional().nullable(),
@@ -3818,16 +3822,29 @@ async function startServer() {
   // =========================================================================
   app.post("/api/order", orderCheckoutLimiter, async (req, res) => {
     try {
+      // 0. Require authenticated user; derive user_id strictly from verified auth token
+      const authUser = await getAuthenticatedUser(req);
+      if (!authUser || !authUser.id) {
+        return res.status(401).json({
+          success: false,
+          message: "Authentication required to place an order."
+        });
+      }
+      const authenticatedUserId = String(authUser.id);
+
       const rawIdempotencyKey = (
         req.headers["x-idempotency-key"] ||
-        req.body.idempotencyKey ||
-        req.body.id ||
+        req.body?.idempotencyKey ||
+        req.body?.id ||
         ""
       ).toString().trim();
+      const scopedIdempotencyKey = rawIdempotencyKey
+        ? `${authenticatedUserId}:${rawIdempotencyKey}`
+        : "";
 
-      // 1. Idempotency Check: prevent duplicate double-orders on mobile lag
-      if (rawIdempotencyKey && idempotencyStore.has(rawIdempotencyKey)) {
-        const existing = idempotencyStore.get(rawIdempotencyKey)!;
+      // 1. Idempotency Check (scoped to authenticated user): prevent duplicate double-orders on mobile lag
+      if (scopedIdempotencyKey && idempotencyStore.has(scopedIdempotencyKey)) {
+        const existing = idempotencyStore.get(scopedIdempotencyKey)!;
         res.setHeader("X-Cache", "IDEMPOTENT-HIT");
         res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
         return res.status(200).json({
@@ -3848,122 +3865,256 @@ async function startServer() {
       }
 
       const validatedOrder = parseResult.data;
+      const sb = getServerSupabase();
 
-      // 2.1 Server-side dynamic price & fee policy validation
-      const computedItemTotal = validatedOrder.items.reduce((sum, it) => {
-        const itemPrice = typeof it.product?.price === "number" ? it.product.price : 0;
-        return sum + itemPrice * (it.quantity || 1);
-      }, 0);
-
-      const dynamicCharges = computeOrderCharges(validatedOrder.items, computedItemTotal);
-
-      // Support submitted fees or server dynamic policy fees
-      const effectiveDeliveryFee = validatedOrder.deliveryFee ?? dynamicCharges.deliveryFee;
-      const effectiveHandlingFee = validatedOrder.handlingFee ?? dynamicCharges.handlingFee;
-      const effectiveRainFee = validatedOrder.rainFee ?? dynamicCharges.rainFee;
-      const effectiveSurgeFee = validatedOrder.surgeFee ?? dynamicCharges.surgeFee;
-      const effectiveProductFee = validatedOrder.productHandlingFee ?? dynamicCharges.totalProductCharges;
-
-      const computedGrandTotal = Math.max(
-        0,
-        computedItemTotal +
-          effectiveDeliveryFee +
-          effectiveHandlingFee +
-          effectiveRainFee +
-          effectiveSurgeFee +
-          effectiveProductFee -
-          (validatedOrder.discount || 0)
+      // 2.1 Server-Authoritative Product Price Lookup (Supabase `products` table -> fallback to server product cache)
+      // Never trust client product.price, fees, discount, or totalAmount.
+      const uniqueProductIds = Array.from(
+        new Set(
+          validatedOrder.items
+            .map((it) => String(it.product?.id || "").trim())
+            .filter(Boolean)
+        )
       );
 
-      if (Math.abs(validatedOrder.totalAmount - computedGrandTotal) > 1) {
+      const dbProductsById = new Map<string, Record<string, any>>();
+      if (sb && uniqueProductIds.length > 0) {
+        try {
+          const { data: dbProducts, error: dbProdError } = await sb
+            .from("products")
+            .select("*")
+            .in("id", uniqueProductIds);
+          if (!dbProdError && Array.isArray(dbProducts)) {
+            for (const prod of dbProducts) {
+              if (prod && prod.id !== undefined && prod.id !== null) {
+                dbProductsById.set(String(prod.id), prod);
+              }
+            }
+          } else if (dbProdError) {
+            console.warn("[Server /api/order Product Lookup Notice]:", dbProdError.message);
+          }
+        } catch (prodQueryErr) {
+          console.warn("[Server /api/order Product Lookup Error]:", prodQueryErr);
+        }
+      }
+
+      const cachedProductsById = new Map<string, Record<string, any>>();
+      const hasMissingProductFromDb = uniqueProductIds.some((id) => !dbProductsById.has(id));
+      if (hasMissingProductFromDb) {
+        if (catalogCache && Array.isArray(catalogCache.products) && catalogCache.products.length > 0) {
+          for (const prod of catalogCache.products) {
+            if (prod && prod.id !== undefined && prod.id !== null) {
+              cachedProductsById.set(String(prod.id), prod);
+            }
+          }
+        }
+        const stillMissing = uniqueProductIds.some(
+          (id) => !dbProductsById.has(id) && !cachedProductsById.has(id)
+        );
+        if (stillMissing) {
+          try {
+            const cached = await getCachedCatalog(false);
+            if (Array.isArray(cached.products)) {
+              for (const prod of cached.products) {
+                if (prod && prod.id !== undefined && prod.id !== null) {
+                  cachedProductsById.set(String(prod.id), prod);
+                }
+              }
+            }
+          } catch (cacheErr) {
+            console.warn("[Server /api/order Catalog Cache Fallback Notice]:", cacheErr);
+          }
+        }
+      }
+
+      const resolvedItemsResult = resolveAuthoritativeOrderItems(
+        validatedOrder.items,
+        dbProductsById,
+        cachedProductsById
+      );
+
+      if (!resolvedItemsResult.ok || !("items" in resolvedItemsResult)) {
+        const failureReason =
+          "reason" in resolvedItemsResult
+            ? resolvedItemsResult.reason
+            : "One or more products in the order could not be verified.";
         return res.status(400).json({
           success: false,
-          message: `Price mismatch: Computed total is ₹${computedGrandTotal}, but submitted total was ₹${validatedOrder.totalAmount}.`
+          message: failureReason
         });
       }
 
-      // 3. Database Persistence (Supabase Orders Table)
-      const formattedServerItems = validatedOrder.items.map((it) => {
-        const color = it.selectedColor || it.product?.selectedColor || undefined;
-        const baseName = it.product?.name || "Electrical Item";
-        const displayName = color ? `${baseName} (${color} Color)` : baseName;
-        return {
-          quantity: it.quantity || 1,
-          selectedColor: color,
-          color: color,
-          product: {
-            ...(it.product || {}),
-            name: displayName,
-            selectedColor: color
-          }
-        };
+      const serverPricingItems = resolvedItemsResult.items.map((item) => item.pricingItem);
+      const formattedServerItems = resolvedItemsResult.items.map((item) => item.formattedItem);
+      const serverItemTotal = resolvedItemsResult.itemTotal;
+
+      // 2.2 Compute fees and grandTotal strictly from server-computed subtotal and server fee policy only
+      const dynamicCharges = computeOrderCharges(
+        serverPricingItems,
+        serverItemTotal,
+        getServerFeePolicy()
+      );
+
+      const effectiveDeliveryFee = dynamicCharges.deliveryFee;
+      const effectiveHandlingFee = dynamicCharges.handlingFee;
+      const effectiveRainFee = dynamicCharges.rainFee;
+      const effectiveSurgeFee = dynamicCharges.surgeFee;
+      const effectiveProductFee = dynamicCharges.totalProductCharges;
+      const effectiveTotalFees = dynamicCharges.totalFees;
+      const serverDiscount = 0;
+      const serverGrandTotal = dynamicCharges.grandTotal;
+
+      // 2.3 Ignore client paymentStatus; verify Razorpay HMAC-SHA256 using crypto.timingSafeEqual
+      const razorpayOrderId = validatedOrder.razorpay_order_id || validatedOrder.razorpayOrderId || null;
+      const razorpayPaymentId = validatedOrder.razorpay_payment_id || validatedOrder.razorpayPaymentId || null;
+      const razorpaySignature = validatedOrder.razorpay_signature || validatedOrder.razorpaySignature || null;
+      const razorpayKeySecret = String(process.env.RAZORPAY_KEY_SECRET || "")
+        .trim()
+        .replace(/^['"]|['"]$/g, "");
+
+      const serverPaymentStatus = verifyRazorpayOrderPaymentStatus({
+        paymentMethod: validatedOrder.paymentMethod,
+        razorpayOrderId,
+        razorpayPaymentId,
+        razorpaySignature,
+        keySecret: razorpayKeySecret
       });
 
-      const serverItemsSummary = formattedServerItems
-        .map((it) => `${it.quantity}x ${it.product?.name || 'Item'}`)
-        .join(', ');
-
-      const sb = getServerSupabase();
       const orderDbId = validatedOrder.id;
-      const cleanHex = orderDbId.replace(/[^a-zA-Z0-9]/g, '');
-      const shortDisplayId = '#' + cleanHex.slice(0, 8).toUpperCase();
+      const cleanHex = orderDbId.replace(/[^a-zA-Z0-9]/g, "");
+      const shortDisplayId = "#" + cleanHex.slice(0, 8).toUpperCase();
+
+      const authoritativeOrder = {
+        ...validatedOrder,
+        id: orderDbId,
+        orderId: orderDbId,
+        order_id: orderDbId,
+        orderNumber: shortDisplayId,
+        trackingNumber: shortDisplayId,
+        tracking_number: shortDisplayId,
+        userId: authenticatedUserId,
+        user_id: authenticatedUserId,
+        items: formattedServerItems,
+        itemTotal: serverItemTotal,
+        deliveryFee: effectiveDeliveryFee,
+        handlingFee: effectiveHandlingFee,
+        rainFee: effectiveRainFee,
+        surgeFee: effectiveSurgeFee,
+        productHandlingFee: effectiveProductFee,
+        fees: effectiveTotalFees,
+        feeBreakdown: dynamicCharges,
+        discount: serverDiscount,
+        totalAmount: serverGrandTotal,
+        paymentStatus: serverPaymentStatus,
+        razorpayOrderId,
+        razorpayPaymentId,
+        razorpaySignature,
+        razorpay_order_id: razorpayOrderId,
+        razorpay_payment_id: razorpayPaymentId,
+        razorpay_signature: razorpaySignature
+      };
+
+      // 3. Ownership Check & Database Insert (never upsert over another user's order)
+      let isExistingSameUserOrder = false;
 
       if (sb) {
         try {
-          await sb.from("orders").upsert(
-            {
+          const { data: existingOrder, error: existingOrderError } = await sb
+            .from("orders")
+            .select("id, user_id")
+            .eq("id", orderDbId)
+            .maybeSingle();
+
+          if (existingOrderError) {
+            console.warn("[Server /api/order Ownership Check Notice]:", existingOrderError.message);
+          } else if (existingOrder) {
+            const existingOwnerId = existingOrder.user_id ? String(existingOrder.user_id) : "";
+            if (existingOwnerId !== authenticatedUserId) {
+              return res.status(409).json({
+                success: false,
+                message: "Order ID conflict: an order with this ID already belongs to another user."
+              });
+            }
+            isExistingSameUserOrder = true;
+          }
+        } catch (lookupErr) {
+          console.warn("[Server /api/order Ownership Lookup Error]:", lookupErr);
+        }
+
+        if (!isExistingSameUserOrder) {
+          try {
+            const { error: insertError } = await sb.from("orders").insert({
               id: orderDbId,
               order_id: orderDbId,
               order_number: shortDisplayId,
               tracking_number: shortDisplayId,
-              user_id: validatedOrder.userId || validatedOrder.user_id || null,
-              customer_name: validatedOrder.customerName,
-              recipient_name: validatedOrder.customerName,
-              phone: validatedOrder.phone,
-              recipient_phone: validatedOrder.phone,
-              customer_email: validatedOrder.customerEmail || null,
-              address: validatedOrder.address,
-              address_line1: validatedOrder.address,
-              area: validatedOrder.area,
-              landmark: validatedOrder.landmark || null,
-              pincode: validatedOrder.pincode,
+              user_id: authenticatedUserId,
+              customer_name: authoritativeOrder.customerName,
+              recipient_name: authoritativeOrder.customerName,
+              phone: authoritativeOrder.phone,
+              recipient_phone: authoritativeOrder.phone,
+              customer_email: authoritativeOrder.customerEmail || null,
+              address: authoritativeOrder.address,
+              address_line1: authoritativeOrder.address,
+              area: authoritativeOrder.area,
+              landmark: authoritativeOrder.landmark || null,
+              pincode: authoritativeOrder.pincode,
               items: formattedServerItems,
-              item_total: validatedOrder.itemTotal,
-              subtotal: validatedOrder.itemTotal,
+              item_total: serverItemTotal,
+              subtotal: serverItemTotal,
               delivery_fee: effectiveDeliveryFee,
               handling_fee: effectiveHandlingFee,
               rain_fee: effectiveRainFee,
               surge_fee: effectiveSurgeFee,
-              fees: (effectiveDeliveryFee + effectiveHandlingFee + effectiveRainFee + effectiveSurgeFee + effectiveProductFee),
-              fee_breakdown: validatedOrder.feeBreakdown || dynamicCharges,
-              discount: validatedOrder.discount,
-              total_amount: validatedOrder.totalAmount,
-              payment_method: validatedOrder.paymentMethod,
-              payment_status: validatedOrder.paymentStatus,
-              payment_id: validatedOrder.paymentId || (validatedOrder as any).razorpay_payment_id || validatedOrder.razorpayPaymentId || null,
-              razorpay_payment_id: (validatedOrder as any).razorpay_payment_id || validatedOrder.razorpayPaymentId || validatedOrder.paymentId || null,
-              razorpay_order_id: (validatedOrder as any).razorpay_order_id || validatedOrder.razorpayOrderId || null,
-              razorpay_signature: (validatedOrder as any).razorpay_signature || validatedOrder.razorpaySignature || null,
-              status: validatedOrder.status,
-              created_at: validatedOrder.createdAt || new Date().toISOString(),
-              placed_at: validatedOrder.createdAt || new Date().toISOString(),
-              estimated_delivery_timestamp: validatedOrder.estimatedDeliveryTimestamp || Date.now() + 3600000,
-              delivery_partner: validatedOrder.deliveryPartner || null,
-              notes: validatedOrder.notes || null
-            },
-            { onConflict: "id" }
-          );
-        } catch (dbErr) {
-          console.warn("[Server /api/order DB Insert Notice]:", dbErr);
+              fees: effectiveTotalFees,
+              fee_breakdown: dynamicCharges,
+              discount: serverDiscount,
+              total_amount: serverGrandTotal,
+              payment_method: authoritativeOrder.paymentMethod,
+              payment_status: serverPaymentStatus,
+              payment_id: razorpayPaymentId || authoritativeOrder.paymentId || null,
+              razorpay_payment_id: razorpayPaymentId,
+              razorpay_order_id: razorpayOrderId,
+              razorpay_signature: razorpaySignature,
+              status: authoritativeOrder.status,
+              created_at: authoritativeOrder.createdAt || new Date().toISOString(),
+              placed_at: authoritativeOrder.createdAt || new Date().toISOString(),
+              estimated_delivery_timestamp: authoritativeOrder.estimatedDeliveryTimestamp || Date.now() + 3600000,
+              delivery_partner: authoritativeOrder.deliveryPartner || null,
+              notes: authoritativeOrder.notes || null
+            });
+
+            if (insertError) {
+              if (insertError.code === "23505") {
+                const { data: conflictingOrder } = await sb
+                  .from("orders")
+                  .select("id, user_id")
+                  .eq("id", orderDbId)
+                  .maybeSingle();
+                const conflictingOwnerId = conflictingOrder?.user_id ? String(conflictingOrder.user_id) : "";
+                if (!conflictingOrder || conflictingOwnerId !== authenticatedUserId) {
+                  return res.status(409).json({
+                    success: false,
+                    message: "Order ID conflict: an order with this ID already belongs to another user."
+                  });
+                }
+                isExistingSameUserOrder = true;
+              } else {
+                console.warn("[Server /api/order DB Insert Notice]:", insertError.message || insertError);
+              }
+            }
+          } catch (dbErr) {
+            console.warn("[Server /api/order DB Insert Notice]:", dbErr);
+          }
         }
       }
 
-      // 4. Automated Notifications (Resend Email + WhatsApp)
-      const phoneClean = validatedOrder.phone.replace(/\D/g, "").slice(-10);
-      const itemsListText = validatedOrder.items
+      // 4. Automated Notifications (Resend Email + WhatsApp) using server-computed totals
+      const phoneClean = authoritativeOrder.phone.replace(/\D/g, "").slice(-10);
+      const itemsListText = formattedServerItems
         .map((it, i) => {
           const color = it.selectedColor || it.product?.selectedColor;
-          const colorBadge = color ? ` [${color} COLOR]` : '';
+          const colorBadge = color ? ` [${color} COLOR]` : "";
           return `${i + 1}. ${it.product?.name || "Item"}${colorBadge} (${it.product?.brand || "SmartRun"}) x ${it.quantity} = ₹${(
             (it.product?.price || 0) * it.quantity
           ).toLocaleString("en-IN")}`;
@@ -3973,68 +4124,77 @@ async function startServer() {
       const whatsappText =
         `⚡ *NEW ORDER RECEIVED - SMARTRUN* ⚡\n\n` +
         `📦 *Order ID:* ${shortDisplayId}\n` +
-        `👤 *Customer:* ${validatedOrder.customerName}\n` +
-        `📱 *Mobile:* ${validatedOrder.phone}\n` +
-        `📍 *DELIVERY ADDRESS:* ${validatedOrder.address}, Area: ${validatedOrder.area}, PIN: ${validatedOrder.pincode}\n\n` +
+        `👤 *Customer:* ${authoritativeOrder.customerName}\n` +
+        `📱 *Mobile:* ${authoritativeOrder.phone}\n` +
+        `📍 *DELIVERY ADDRESS:* ${authoritativeOrder.address}, Area: ${authoritativeOrder.area}, PIN: ${authoritativeOrder.pincode}\n\n` +
         `🛒 *ORDERED ITEMS:*\n${itemsListText}\n\n` +
-        `💳 *GRAND TOTAL:* ₹${validatedOrder.totalAmount.toLocaleString("en-IN")} (${validatedOrder.paymentMethod.toUpperCase()})\n` +
+        `💳 *GRAND TOTAL:* ₹${serverGrandTotal.toLocaleString("en-IN")} (${authoritativeOrder.paymentMethod.toUpperCase()})\n` +
         `⚡ *Dispatch:* SmartRun materials pvt. ltd, Kheyadah Village, Bhagabanpur, Kolkata 700150`;
 
       const whatsappUrl = `https://wa.me/${ADMIN_WHATSAPP_NUMBER}?text=${encodeURIComponent(whatsappText)}`;
       const customerWhatsappUrl = phoneClean
         ? `https://wa.me/91${phoneClean}?text=${encodeURIComponent(
-            `Hello ${validatedOrder.customerName}, thank you for ordering from SmartRun! Your Order ${shortDisplayId} for ₹${validatedOrder.totalAmount.toLocaleString("en-IN")} is confirmed for 60-min express dispatch.`
+            `Hello ${authoritativeOrder.customerName}, thank you for ordering from SmartRun! Your Order ${shortDisplayId} for ₹${serverGrandTotal.toLocaleString("en-IN")} is confirmed for 60-min express dispatch.`
           )}`
         : null;
 
-      // Background Resend Notifications
-      try {
-        const adminHtml = generateAdminOrderAlertHtml(validatedOrder);
-        const adminSubject = `🚨 [NEW ORDER] ${shortDisplayId} (₹${validatedOrder.totalAmount.toLocaleString("en-IN")}) - ${validatedOrder.customerName}`;
-        dispatchResendEmail({
-          to: ADMIN_EMAILS,
-          subject: adminSubject,
-          html: adminHtml,
-          text: `New order ${shortDisplayId} placed by ${validatedOrder.customerName} (${validatedOrder.phone}). Amount: ₹${validatedOrder.totalAmount}.`
-        }).catch(() => {});
-
-        if (validatedOrder.customerEmail && validatedOrder.customerEmail.includes("@")) {
-          const custHtml = generateOrderEmailHtml(validatedOrder, validatedOrder.customerName);
-          const custSubject = `⚡ Order Confirmed ${shortDisplayId} - SmartRun Express Kolkata`;
+      // Background Resend Notifications (skip duplicates on same-user idempotent retry)
+      if (!isExistingSameUserOrder) {
+        try {
+          const adminHtml = generateAdminOrderAlertHtml(authoritativeOrder);
+          const adminSubject = `🚨 [NEW ORDER] ${shortDisplayId} (₹${serverGrandTotal.toLocaleString("en-IN")}) - ${authoritativeOrder.customerName}`;
           dispatchResendEmail({
-            type: "order",
-            from: "SmartRun Orders <order@smartrun.in>",
-            to: [validatedOrder.customerEmail.trim()],
-            subject: custSubject,
-            html: custHtml,
-            text: `Your SmartRun order ${shortDisplayId} has been confirmed. Total: ₹${validatedOrder.totalAmount}. Delivery to ${validatedOrder.area}, Kolkata.`
+            to: ADMIN_EMAILS,
+            subject: adminSubject,
+            html: adminHtml,
+            text: `New order ${shortDisplayId} placed by ${authoritativeOrder.customerName} (${authoritativeOrder.phone}). Amount: ₹${serverGrandTotal}.`
           }).catch(() => {});
+
+          if (authoritativeOrder.customerEmail && authoritativeOrder.customerEmail.includes("@")) {
+            const custHtml = generateOrderEmailHtml(authoritativeOrder, authoritativeOrder.customerName);
+            const custSubject = `⚡ Order Confirmed ${shortDisplayId} - SmartRun Express Kolkata`;
+            dispatchResendEmail({
+              type: "order",
+              from: "SmartRun Orders <order@smartrun.in>",
+              to: [authoritativeOrder.customerEmail.trim()],
+              subject: custSubject,
+              html: custHtml,
+              text: `Your SmartRun order ${shortDisplayId} has been confirmed. Total: ₹${serverGrandTotal}. Delivery to ${authoritativeOrder.area}, Kolkata.`
+            }).catch(() => {});
+          }
+        } catch (emailErr) {
+          console.warn("[Server /api/order Notification Notice]:", emailErr);
         }
-      } catch (emailErr) {
-        console.warn("[Server /api/order Notification Notice]:", emailErr);
       }
 
       const orderResponse = {
         success: true,
-        order: validatedOrder,
-        orderId: validatedOrder.id,
+        order: authoritativeOrder,
+        orderId: authoritativeOrder.id,
         adminAlertSent: true,
-        customerInvoiceSent: Boolean(validatedOrder.customerEmail),
+        customerInvoiceSent: Boolean(authoritativeOrder.customerEmail),
         whatsappUrl,
         customerWhatsappUrl,
         message: "Order validated and confirmed successfully!"
       };
 
-      // Store in idempotency cache
-      if (rawIdempotencyKey) {
-        idempotencyStore.set(rawIdempotencyKey, {
-          orderId: validatedOrder.id,
+      // Store in user-scoped idempotency cache
+      if (scopedIdempotencyKey) {
+        idempotencyStore.set(scopedIdempotencyKey, {
+          orderId: authoritativeOrder.id,
           response: orderResponse,
           timestamp: Date.now()
         });
       }
 
       res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+      if (isExistingSameUserOrder) {
+        res.setHeader("X-Cache", "IDEMPOTENT-HIT");
+        return res.status(200).json({
+          ...orderResponse,
+          idempotent: true
+        });
+      }
       return res.status(201).json(orderResponse);
     } catch (err: any) {
       console.error("Error placing order via /api/order:", err);

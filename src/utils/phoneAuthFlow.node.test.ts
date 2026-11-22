@@ -237,3 +237,21 @@ test('APK and production web strictly enforce smartrun.in (never localhost or fi
   assert.ok(rp.expectedOrigins.includes('https://app.smartrun.in'));
   assert.ok(rp.expectedOrigins.includes('https://www.smartrun.in'));
 });
+
+test('AndroidManifest HTTPS App Links scope to app routes so /__/auth/* is never hijacked from Firebase RecaptchaActivity', async () => {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const manifest = fs.readFileSync(
+    path.resolve(process.cwd(), 'android/app/src/main/AndroidManifest.xml'),
+    'utf8'
+  );
+  const autoVerifyMatch = manifest.match(/<intent-filter[^>]*android:autoVerify="true"[^>]*>([\s\S]*?)<\/intent-filter>/);
+  assert.ok(autoVerifyMatch, 'Expected android:autoVerify="true" App Link intent-filter');
+  const filterBody = autoVerifyMatch[1];
+  // Must declare explicit path/pathPrefix entries instead of wildcard host-only matching
+  assert.match(filterBody, /android:pathPrefix="\/electrical"/);
+  assert.match(filterBody, /android:pathPrefix="\/login"/);
+  assert.doesNotMatch(filterBody, /\/__\/auth/);
+  assert.doesNotMatch(filterBody, /\/__\/firebase/);
+});
+

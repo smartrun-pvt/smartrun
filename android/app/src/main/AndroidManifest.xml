@@ -38,13 +38,49 @@
                 <data android:scheme="in.smartrun.app" />
             </intent-filter>
 
-            <!-- Primary Verified HTTPS App Links for SmartRun -->
+            <!-- Primary Verified HTTPS App Links for SmartRun (explicitly scoped to app routes so /__/auth/* opens in Chrome Custom Tabs for Firebase reCAPTCHA) -->
             <intent-filter android:autoVerify="true">
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
-                <data android:scheme="https" android:host="smartrun.in" />
-                <data android:scheme="https" android:host="www.smartrun.in" />
+                <data android:scheme="https" />
+                <data android:host="smartrun.in" />
+                <data android:host="www.smartrun.in" />
+                <data android:path="" />
+                <data android:path="/" />
+                <data android:pathPrefix="/electrical" />
+                <data android:pathPrefix="/construction" />
+                <data android:pathPrefix="/product" />
+                <data android:pathPrefix="/technicians" />
+                <data android:pathPrefix="/cart" />
+                <data android:pathPrefix="/orders" />
+                <data android:pathPrefix="/live-order" />
+                <data android:pathPrefix="/track-order" />
+                <data android:pathPrefix="/profile" />
+                <data android:pathPrefix="/login" />
+                <data android:pathPrefix="/auth" />
+                <data android:pathPrefix="/reset-password" />
+                <data android:pathPrefix="/personal-info" />
+                <data android:pathPrefix="/app" />
+                <data android:pathPrefix="/download" />
+                <data android:pathPrefix="/delivery-areas" />
+                <data android:pathPrefix="/service-areas" />
+                <data android:pathPrefix="/contact" />
+                <data android:pathPrefix="/support" />
+                <data android:pathPrefix="/about" />
+                <data android:pathPrefix="/faq" />
+                <data android:pathPrefix="/shipping" />
+                <data android:pathPrefix="/return" />
+                <data android:pathPrefix="/refund" />
+                <data android:pathPrefix="/privacy" />
+                <data android:pathPrefix="/terms" />
+                <data android:pathPrefix="/delete" />
+                <data android:pathPrefix="/account-deletion" />
+                <data android:pathPrefix="/how-to-use" />
+                <data android:pathPrefix="/guide" />
+                <data android:pathPrefix="/sitemap" />
+                <data android:pathPrefix="/services" />
+                <data android:pathPrefix="/wiring" />
             </intent-filter>
 
         </activity>

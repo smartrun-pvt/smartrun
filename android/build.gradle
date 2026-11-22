@@ -103,4 +103,15 @@ gradle.projectsEvaluated {
     }
 }
 
-
+// Disable Kotlin 2.2+ Maven Central PGP publishing helper tasks (e.g. :capacitor-geolocation:generatePgpKeys)
+// on third-party library subprojects so they cannot fail Android app builds when invoked without Maven signing args.
+subprojects { sub ->
+    if (sub.path != ':app') {
+        sub.tasks.matching {
+            it.name == 'generatePgpKeys' || it.name == 'uploadPublicPgpKey' || it.name == 'checkSigningConfiguration'
+        }.configureEach {
+            enabled = false
+            onlyIf { false }
+        }
+    }
+}
