@@ -11,3 +11,5 @@ coverage/
 *.p12
 *.key
 smartrun-release-key.jks
+google-services.json
+android/app/google-services.json

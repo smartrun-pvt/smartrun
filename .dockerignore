@@ -9,3 +9,4 @@ ios
 twa-archive
 .aistudio
 *.log
+**/google-services.json
