@@ -751,30 +751,34 @@ export const HomePage = React.memo(({
                   </div>
 
                   {/* Poster Content */}
-                  <div className="relative z-10 max-w-2xl sm:max-w-3xl space-y-2 sm:space-y-3">
-                    {/* Header Tagline or Author Indicator */}
-                    <div className="flex items-center gap-2 text-xs sm:text-sm font-semibold tracking-wide text-amber-300/95">
-                      {poster.type === 'quote' ? (
-                        <span className="italic">✦ {poster.quoteAuthor}</span>
-                      ) : (
-                        <span>● {poster.tagline}</span>
-                      )}
-                    </div>
+                  <div className="relative z-10 w-full flex flex-col justify-between gap-2 sm:gap-3">
+                    <div className="max-w-2xl sm:max-w-3xl space-y-2 sm:space-y-3">
+                      {/* Header Tagline or Author Indicator */}
+                      <div className="flex items-center gap-2 text-xs sm:text-sm font-semibold tracking-wide text-amber-300/95">
+                        {poster.type === 'quote' ? (
+                          <span className="italic">✦ {poster.quoteAuthor}</span>
+                        ) : (
+                          <span>● {poster.tagline}</span>
+                        )}
+                      </div>
 
-                    <h2 className="text-xl sm:text-3xl md:text-4xl font-black tracking-tight leading-tight drop-shadow-sm font-serif line-clamp-2">
-                      {poster.title}
-                    </h2>
-                    <p className="text-xs sm:text-sm md:text-base text-slate-100/90 max-w-xl sm:max-w-2xl leading-relaxed font-medium line-clamp-2">
-                      {poster.subtitle}
-                    </p>
-                    <div className="pt-1.5 sm:pt-2 flex flex-wrap items-center gap-3">
+                      <h2 className="text-xl sm:text-3xl md:text-4xl font-black tracking-tight leading-tight drop-shadow-sm font-serif line-clamp-2">
+                        {poster.title}
+                      </h2>
+                      <p className="text-xs sm:text-sm md:text-base text-slate-100/90 max-w-xl sm:max-w-2xl leading-relaxed font-medium line-clamp-2">
+                        {poster.subtitle}
+                      </p>
+                    </div>
+                    <div className="pt-1.5 sm:pt-2 w-full flex flex-wrap items-center justify-end gap-3">
                       <Link
                         to={poster.link}
                         tabIndex={isActive ? 0 : -1}
-                        className="px-4 sm:px-5 py-2 sm:py-2.5 rounded-xl bg-white/20 hover:bg-white/30 text-white font-bold text-xs sm:text-sm backdrop-blur-md border border-white/40 shadow-xs hover:shadow-sm transition-all hover:scale-[1.02] active:scale-95 flex items-center gap-2 cursor-pointer"
+                        className="group/btn relative overflow-hidden inline-flex items-center gap-2 px-4 sm:px-5 py-2 sm:py-2.5 rounded-2xl bg-gradient-to-b from-white/30 via-white/18 to-white/10 hover:from-white/38 hover:via-cyan-100/22 hover:to-emerald-200/18 text-white font-bold text-xs sm:text-sm backdrop-blur-xl backdrop-saturate-150 border border-white/50 hover:border-white/75 shadow-[inset_0_1.5px_1px_rgba(255,255,255,0.72),inset_0_-2px_6px_rgba(255,255,255,0.12),0_8px_24px_rgba(0,0,0,0.22)] hover:shadow-[inset_0_1.5px_1.5px_rgba(255,255,255,0.85),inset_0_-2px_8px_rgba(56,189,248,0.25),0_10px_28px_rgba(14,165,233,0.25)] transition-all duration-300 hover:scale-[1.02] active:scale-[0.98] cursor-pointer"
                       >
-                        {poster.ctaText}
-                        <ChevronRight className="w-4 h-4 text-amber-300" />
+                        <span aria-hidden="true" className="pointer-events-none absolute inset-x-0 top-0 h-[50%] bg-gradient-to-b from-white/50 via-white/15 to-transparent rounded-t-2xl" />
+                        <span aria-hidden="true" className="pointer-events-none absolute inset-x-3 bottom-0 h-[28%] bg-gradient-to-t from-sky-300/25 via-emerald-300/10 to-transparent rounded-b-2xl" />
+                        <span className="relative z-10 drop-shadow-[0_1px_1px_rgba(0,0,0,0.28)]">{poster.ctaText}</span>
+                        <ChevronRight className="relative z-10 w-4 h-4 text-white/95 transition-transform duration-200 group-hover/btn:translate-x-0.5 drop-shadow-[0_1px_1px_rgba(0,0,0,0.28)]" />
                       </Link>
                     </div>
                   </div>
@@ -1082,17 +1086,17 @@ export const HomePage = React.memo(({
               </p>
             </div>
 
-            <div className="relative z-10 pt-1">
+            <div className="relative z-10 pt-1 w-full flex justify-end">
               <a
                 href="https://wa.me/918777400280?text=Hi%20SmartRun,%20I%20have%20a%20contractor%20bulk%20inquiry."
                 target="_blank"
                 rel="noreferrer"
-                className="relative overflow-hidden inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-gradient-to-b from-white via-slate-100 to-slate-200 hover:from-white hover:via-amber-50 hover:to-amber-100 text-slate-950 font-black font-sf-pro text-xs transition-all duration-200 cursor-pointer active:scale-98 border border-white/90 shadow-[inset_0_1.5px_1px_rgba(255,255,255,0.9),inset_0_-2px_4px_rgba(0,0,0,0.15),0_4px_12px_rgba(0,0,0,0.2)]"
+                className="group/btn relative overflow-hidden inline-flex items-center gap-2 px-5 py-2.5 rounded-2xl bg-gradient-to-b from-white/30 via-white/18 to-white/10 hover:from-white/38 hover:via-cyan-100/22 hover:to-emerald-200/18 text-white font-bold font-sf-pro text-xs backdrop-blur-xl backdrop-saturate-150 border border-white/50 hover:border-white/75 shadow-[inset_0_1.5px_1px_rgba(255,255,255,0.72),inset_0_-2px_6px_rgba(255,255,255,0.12),0_8px_24px_rgba(0,0,0,0.22)] hover:shadow-[inset_0_1.5px_1.5px_rgba(255,255,255,0.85),inset_0_-2px_8px_rgba(56,189,248,0.25),0_10px_28px_rgba(14,165,233,0.25)] transition-all duration-300 hover:scale-[1.02] active:scale-[0.98] cursor-pointer"
               >
-                {/* Apple-style Top Specular Liquid Glass Sheen */}
-                <span className="pointer-events-none absolute inset-x-0 top-0 h-[48%] bg-gradient-to-b from-white/70 to-transparent rounded-t-[10px]" />
-                <span className="relative z-10">Chat with Project Desk</span>
-                <ChevronRight className="w-3.5 h-3.5 relative z-10 text-slate-900" />
+                <span aria-hidden="true" className="pointer-events-none absolute inset-x-0 top-0 h-[50%] bg-gradient-to-b from-white/50 via-white/15 to-transparent rounded-t-2xl" />
+                <span aria-hidden="true" className="pointer-events-none absolute inset-x-3 bottom-0 h-[28%] bg-gradient-to-t from-sky-300/25 via-emerald-300/10 to-transparent rounded-b-2xl" />
+                <span className="relative z-10 drop-shadow-[0_1px_1px_rgba(0,0,0,0.28)]">Chat with Project Desk</span>
+                <ChevronRight className="w-3.5 h-3.5 relative z-10 text-white/95 transition-transform duration-200 group-hover/btn:translate-x-0.5 drop-shadow-[0_1px_1px_rgba(0,0,0,0.28)]" />
               </a>
             </div>
           </div>
@@ -1119,15 +1123,15 @@ export const HomePage = React.memo(({
               </p>
             </div>
 
-            <div className="relative z-10 pt-1">
+            <div className="relative z-10 pt-1 w-full flex justify-end">
               <button
                 onClick={() => navigate('/technicians')}
-                className="relative overflow-hidden inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-gradient-to-b from-[#FDE047] via-[#FBBF24] to-[#F59E0B] hover:from-[#FEF08A] hover:via-[#FCD34D] hover:to-[#FBBF24] text-slate-950 font-black font-sf-pro text-xs transition-all duration-200 cursor-pointer active:scale-98 border border-yellow-100/80 shadow-[inset_0_1.5px_1px_rgba(255,255,255,0.85),inset_0_-2px_4px_rgba(180,83,9,0.25),0_4px_14px_rgba(245,158,11,0.32)]"
+                className="group/btn relative overflow-hidden inline-flex items-center gap-2 px-5 py-2.5 rounded-2xl bg-gradient-to-b from-white/28 via-emerald-300/18 to-sky-400/14 hover:from-white/36 hover:via-emerald-300/26 hover:to-sky-400/22 text-white font-bold font-sf-pro text-xs backdrop-blur-xl backdrop-saturate-150 border border-white/45 hover:border-white/70 shadow-[inset_0_1.5px_1px_rgba(255,255,255,0.68),inset_0_-2px_6px_rgba(16,185,129,0.18),0_8px_24px_rgba(0,0,0,0.28)] hover:shadow-[inset_0_1.5px_1.5px_rgba(255,255,255,0.82),inset_0_-2px_8px_rgba(56,189,248,0.28),0_10px_28px_rgba(16,185,129,0.24)] transition-all duration-300 hover:scale-[1.02] active:scale-[0.98] cursor-pointer"
               >
-                {/* Apple-style Top Specular Liquid Glass Sheen */}
-                <span className="pointer-events-none absolute inset-x-0 top-0 h-[48%] bg-gradient-to-b from-white/60 to-transparent rounded-t-[10px]" />
-                <span className="relative z-10">Book Certified Electrician</span>
-                <ChevronRight className="w-3.5 h-3.5 relative z-10 text-slate-950" />
+                <span aria-hidden="true" className="pointer-events-none absolute inset-x-0 top-0 h-[50%] bg-gradient-to-b from-white/48 via-white/14 to-transparent rounded-t-2xl" />
+                <span aria-hidden="true" className="pointer-events-none absolute inset-x-3 bottom-0 h-[28%] bg-gradient-to-t from-emerald-300/30 via-sky-300/12 to-transparent rounded-b-2xl" />
+                <span className="relative z-10 drop-shadow-[0_1px_1px_rgba(0,0,0,0.3)]">Book Certified Electrician</span>
+                <ChevronRight className="w-3.5 h-3.5 relative z-10 text-white/95 transition-transform duration-200 group-hover/btn:translate-x-0.5 drop-shadow-[0_1px_1px_rgba(0,0,0,0.3)]" />
               </button>
             </div>
           </div>
