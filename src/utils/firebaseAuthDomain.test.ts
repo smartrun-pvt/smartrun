@@ -2,9 +2,11 @@ import { describe, it, expect } from 'vitest';
 import {
   PRODUCTION_APP_ORIGIN,
   PRODUCTION_FIREBASE_AUTH_DOMAIN,
+  CAPACITOR_APK_HOSTNAME,
   normalizeAuthDomainHostname,
   resolvePublicAppOrigin,
   resolveFirebaseAuthDomainForEnv,
+  shouldAllowFallbackFirebaseAuthDomain,
   normalizeNativeFirebaseAuthError,
   shouldArmNativeSmsConsent,
   buildRecaptchaSlotId,
@@ -105,6 +107,49 @@ describe('firebaseAuthDomain helpers', () => {
         fallbackAuthDomain: 'gen-lang-client-0708778333.firebaseapp.com',
       })
     ).toBe('gen-lang-client-0708778333.firebaseapp.com');
+  });
+
+  it('enforces www.smartrun.in for app.smartrun.in APK WebView and rejects localhost/firebaseapp overrides on production', () => {
+    expect(CAPACITOR_APK_HOSTNAME).toBe('app.smartrun.in');
+    expect(
+      resolveFirebaseAuthDomainForEnv({
+        configuredDomain: '',
+        isNativePlatform: false,
+        windowHostname: 'app.smartrun.in',
+        fallbackAuthDomain: 'gen-lang-client-0708778333.firebaseapp.com',
+      })
+    ).toBe('www.smartrun.in');
+
+    expect(
+      resolveFirebaseAuthDomainForEnv({
+        configuredDomain: 'localhost',
+        isNativePlatform: true,
+        windowHostname: 'app.smartrun.in',
+        fallbackAuthDomain: 'gen-lang-client-0708778333.firebaseapp.com',
+      })
+    ).toBe('www.smartrun.in');
+
+    expect(
+      resolveFirebaseAuthDomainForEnv({
+        configuredDomain: 'gen-lang-client-0708778333.firebaseapp.com',
+        isNativePlatform: false,
+        windowHostname: 'smartrun.in',
+        fallbackAuthDomain: 'gen-lang-client-0708778333.firebaseapp.com',
+      })
+    ).toBe('www.smartrun.in');
+
+    expect(
+      shouldAllowFallbackFirebaseAuthDomain({ isNativePlatform: true, windowHostname: 'app.smartrun.in' })
+    ).toBe(false);
+    expect(
+      shouldAllowFallbackFirebaseAuthDomain({ isNativePlatform: false, windowHostname: 'smartrun.in' })
+    ).toBe(false);
+    expect(
+      shouldAllowFallbackFirebaseAuthDomain({ isNativePlatform: false, windowHostname: 'www.smartrun.in' })
+    ).toBe(false);
+    expect(
+      shouldAllowFallbackFirebaseAuthDomain({ isNativePlatform: false, windowHostname: 'localhost' })
+    ).toBe(true);
   });
 
   it('normalizes native Android Firebase Phone Auth error payloads into standard auth/* codes', () => {

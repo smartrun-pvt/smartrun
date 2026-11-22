@@ -2230,34 +2230,45 @@ async function startServer() {
     }
   });
 
-  // Universal Secure CORS Middleware: Validates trusted origins before granting credentials
+  // Universal Secure CORS Middleware: Strictly enforces smartrun.in origins in production
+  // and blocks arbitrary untrusted origin reflection.
   app.use((req, res, next) => {
     const origin = req.headers.origin;
-    const isAllowedOrigin =
-      !origin ||
-      origin === "https://www.smartrun.in" ||
-      origin === "https://smartrun.in" ||
-      origin === "https://www.girirajpower.in" ||
-      origin === "https://girirajpower.in" ||
-      origin === "https://localhost" ||
-      origin === "http://localhost" ||
-      origin.startsWith("http://localhost:") ||
-      origin.startsWith("http://127.0.0.1:") ||
-      origin.startsWith("capacitor://") ||
-      origin.startsWith("ionic://") ||
-      origin.startsWith("smartrun://") ||
-      origin.endsWith(".run.app") ||
-      origin.endsWith(".googleusercontent.com") ||
-      origin.endsWith(".aistudio.google.com");
+    const isProductionServer = process.env.NODE_ENV === "production";
 
-    if (origin && isAllowedOrigin) {
-      res.setHeader("Access-Control-Allow-Origin", origin);
-      res.setHeader("Access-Control-Allow-Credentials", "true");
-    } else if (!origin) {
-      res.setHeader("Access-Control-Allow-Origin", "*");
-    } else {
-      res.setHeader("Access-Control-Allow-Origin", origin);
-      // Untrusted origins are not permitted credentials
+    const isSmartRunProductionOrigin = Boolean(
+      origin &&
+        (origin === "https://www.smartrun.in" ||
+          origin === "https://smartrun.in" ||
+          origin === "https://app.smartrun.in" ||
+          origin === "capacitor://app.smartrun.in" ||
+          origin === "capacitor://www.smartrun.in" ||
+          origin === "capacitor://smartrun.in" ||
+          origin.startsWith("smartrun://"))
+    );
+
+    const isDevOrPreviewOrigin = Boolean(
+      !isProductionServer &&
+        origin &&
+        (origin === "https://localhost" ||
+          origin === "http://localhost" ||
+          origin.startsWith("http://localhost:") ||
+          origin.startsWith("http://127.0.0.1:") ||
+          origin.startsWith("capacitor://") ||
+          origin.startsWith("ionic://") ||
+          origin.endsWith(".run.app") ||
+          origin.endsWith(".googleusercontent.com") ||
+          origin.endsWith(".aistudio.google.com"))
+    );
+
+    const isAllowedOrigin = !origin || isSmartRunProductionOrigin || isDevOrPreviewOrigin;
+
+    if (origin) {
+      res.setHeader("Vary", "Origin");
+      if (isAllowedOrigin) {
+        res.setHeader("Access-Control-Allow-Origin", origin);
+        res.setHeader("Access-Control-Allow-Credentials", "true");
+      }
     }
 
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
@@ -2265,6 +2276,9 @@ async function startServer() {
     res.setHeader("Access-Control-Expose-Headers", "ETag, X-Cache, Content-Disposition, Set-Cookie");
 
     if (req.method === "OPTIONS") {
+      if (origin && !isAllowedOrigin) {
+        return res.status(403).end();
+      }
       return res.status(204).end();
     }
     next();
@@ -2736,25 +2750,43 @@ async function startServer() {
         }
       }
 
-      const upstreamRes = await fetch(targetUrl, {
-        method: req.method,
-        headers: forwardHeaders,
-        body: upstreamBody,
-        redirect: "manual",
-      });
+      const proxyController = new AbortController();
+      const proxyTimeout = setTimeout(() => proxyController.abort(), 15000);
+      let upstreamRes: Response;
+      try {
+        upstreamRes = await fetch(targetUrl, {
+          method: req.method,
+          headers: forwardHeaders,
+          body: upstreamBody,
+          redirect: "manual",
+          signal: proxyController.signal,
+        });
+      } finally {
+        clearTimeout(proxyTimeout);
+      }
 
       res.status(upstreamRes.status);
-      const lowerReqHost = reqHost.toLowerCase();
+      const lowerReqHost = reqHost.split(":")[0].toLowerCase();
+      const isHttpsReq = req.secure || req.headers["x-forwarded-proto"] === "https";
       const publicOrigin =
-        lowerReqHost === "smartrun.in" || lowerReqHost === "www.smartrun.in"
+        lowerReqHost === "smartrun.in"
+          ? "https://smartrun.in"
+          : lowerReqHost === "www.smartrun.in"
           ? "https://www.smartrun.in"
-          : `https://${reqHost}`;
-      const setCookies =
+          : lowerReqHost === "app.smartrun.in"
+          ? "https://app.smartrun.in"
+          : `${isHttpsReq ? "https" : "http"}://${reqHost}`;
+
+      const rawSetCookies: string[] =
         typeof (upstreamRes.headers as any).getSetCookie === "function"
           ? (upstreamRes.headers as any).getSetCookie()
           : [];
-      if (Array.isArray(setCookies) && setCookies.length > 0) {
-        res.setHeader("set-cookie", setCookies);
+      const sanitizedSetCookies = rawSetCookies.map((cookieStr) =>
+        // Strip upstream *.firebaseapp.com cookie Domain so browser binds cookies cleanly to smartrun.in
+        cookieStr.replace(/;\s*Domain=[^;]*firebaseapp\.com/gi, "")
+      );
+      if (sanitizedSetCookies.length > 0) {
+        res.setHeader("set-cookie", sanitizedSetCookies);
       }
       upstreamRes.headers.forEach((value, key) => {
         const lower = key.toLowerCase();
@@ -2762,7 +2794,7 @@ async function startServer() {
           lower === "content-encoding" ||
           lower === "transfer-encoding" ||
           lower === "content-length" ||
-          (lower === "set-cookie" && Array.isArray(setCookies) && setCookies.length > 0)
+          (lower === "set-cookie" && sanitizedSetCookies.length > 0)
         ) {
           return;
         }
@@ -8106,7 +8138,16 @@ Knowledge Base & Service Details:
     return { valid: false };
   }
 
-  // Helper to attach session cookie to response
+  // Helper to attach session cookie to response (scoped to .smartrun.in on production HTTPS)
+  function isSmartRunRequestHost(req: express.Request): boolean {
+    const rawHost = String(req.headers["x-forwarded-host"] || req.get("host") || "")
+      .split(",")[0]
+      .trim()
+      .split(":")[0]
+      .toLowerCase();
+    return rawHost === "smartrun.in" || rawHost === "www.smartrun.in" || rawHost.endsWith(".smartrun.in");
+  }
+
   function setServerSessionCookie(req: express.Request, res: express.Response, token: string): void {
     const isHttps = req.secure || req.headers["x-forwarded-proto"] === "https";
     const cookieParts = [
@@ -8116,6 +8157,9 @@ Knowledge Base & Service Details:
       "Max-Age=2592000", // 30 days
       "SameSite=Lax"
     ];
+    if (isHttps && isSmartRunRequestHost(req)) {
+      cookieParts.push("Domain=.smartrun.in");
+    }
     if (isHttps) {
       cookieParts.push("Secure");
     }
@@ -8124,7 +8168,7 @@ Knowledge Base & Service Details:
 
   function clearServerSessionCookie(req: express.Request, res: express.Response): void {
     const isHttps = req.secure || req.headers["x-forwarded-proto"] === "https";
-    const cookieParts = [
+    const baseParts = [
       "smartrun_session=",
       "Path=/",
       "HttpOnly",
@@ -8133,9 +8177,16 @@ Knowledge Base & Service Details:
       "SameSite=Lax"
     ];
     if (isHttps) {
-      cookieParts.push("Secure");
+      baseParts.push("Secure");
     }
-    res.setHeader("Set-Cookie", cookieParts.join("; "));
+    if (isHttps && isSmartRunRequestHost(req)) {
+      res.setHeader("Set-Cookie", [
+        baseParts.join("; "),
+        [...baseParts, "Domain=.smartrun.in"].join("; ")
+      ]);
+      return;
+    }
+    res.setHeader("Set-Cookie", baseParts.join("; "));
   }
 
   /**

@@ -8,49 +8,85 @@ import { Capacitor } from '@capacitor/core';
  * relative paths during local development and cloud web deployments.
  */
 export const PRODUCTION_APP_ORIGIN = 'https://www.smartrun.in';
+export const CAPACITOR_APK_HOSTNAME = 'app.smartrun.in';
 
-export const API_BASE_URL: string = (() => {
-  // 1. Prioritize explicit environment variables if set
-  const env = typeof import.meta !== 'undefined' && import.meta.env ? import.meta.env : (process.env as any || {});
-  const explicitApiUrl =
-    env.VITE_API_URL ||
-    env.VITE_API_BASE_URL ||
-    env.VITE_API_KEY ||
-    env.API_KEY;
+export interface ApiBaseResolutionContext {
+  explicitApiUrl?: string;
+  isNativePlatform?: boolean;
+  platform?: string;
+  origin?: string;
+  hostname?: string;
+  port?: string;
+}
 
-  if (explicitApiUrl) {
-    // Trim whitespace and remove trailing slashes
-    const cleaned = String(explicitApiUrl).trim().replace(/\/+$/, '');
-    if (cleaned.startsWith('http://') || cleaned.startsWith('https://')) {
-      return cleaned;
-    }
+function isLocalhostLikeUrl(urlStr: string): boolean {
+  try {
+    const host = new URL(urlStr).hostname.toLowerCase();
+    return host === 'localhost' || host === '127.0.0.1' || host === '10.0.2.2' || host === '::1';
+  } catch {
+    return /localhost|127\.0\.0\.1|10\.0\.2\.2/i.test(urlStr);
   }
+}
 
-  if (typeof window === 'undefined') return '';
+/**
+ * Pure, testable API Base URL resolver across Native Android/iOS APK and Web.
+ * Guarantees APK builds (running at https://app.smartrun.in) ALWAYS call https://www.smartrun.in
+ * and never route API traffic to localhost or a bundled asset host.
+ */
+export function resolveApiBaseUrl(ctx: ApiBaseResolutionContext): string {
+  const origin = String(ctx.origin || '').trim();
+  const hostname = String(ctx.hostname || '').trim().toLowerCase();
+  const port = String(ctx.port || '').trim();
+  const platform = String(ctx.platform || '').trim().toLowerCase();
 
-  const origin = window.location.origin || '';
-  const hostname = window.location.hostname || '';
-  const port = window.location.port || '';
-
-  // 2. Comprehensive check for Native Android & iOS Capacitor runtime
   const isCapacitorNative =
-    Capacitor.isNativePlatform() ||
-    Capacitor.getPlatform() === 'android' ||
-    Capacitor.getPlatform() === 'ios' ||
-    (typeof (window as any).Capacitor !== 'undefined' && (window as any).Capacitor?.isNativePlatform?.()) ||
+    Boolean(ctx.isNativePlatform) ||
+    platform === 'android' ||
+    platform === 'ios' ||
+    hostname === CAPACITOR_APK_HOSTNAME ||
     origin.startsWith('capacitor://') ||
     origin.startsWith('ionic://') ||
     origin.startsWith('file://') ||
-    // On Android Capacitor with androidScheme: 'https', origin is strictly https://localhost without port
     (origin === 'https://localhost' && (!port || port === '443')) ||
-    // Common emulator loopback addresses when testing on Android
     hostname === '10.0.2.2';
+
+  const explicit = String(ctx.explicitApiUrl || '').trim().replace(/\/+$/, '');
+  if (explicit && (explicit.startsWith('http://') || explicit.startsWith('https://'))) {
+    // Never allow a stray localhost/127.0.0.1 env value to hijack production APK or smartrun.in web traffic
+    const isProductionWeb = hostname === 'smartrun.in' || hostname === 'www.smartrun.in';
+    if ((isCapacitorNative || isProductionWeb) && isLocalhostLikeUrl(explicit)) {
+      return isCapacitorNative ? PRODUCTION_APP_ORIGIN : '';
+    }
+    return explicit;
+  }
 
   if (isCapacitorNative) {
     return PRODUCTION_APP_ORIGIN;
   }
 
   return '';
+}
+
+export const API_BASE_URL: string = (() => {
+  const env = typeof import.meta !== 'undefined' && import.meta.env ? import.meta.env : ((process as any)?.env || {});
+  const explicitApiUrl = env.VITE_API_URL || env.VITE_API_BASE_URL || '';
+
+  if (typeof window === 'undefined') {
+    return resolveApiBaseUrl({ explicitApiUrl });
+  }
+
+  const nativeWindowCap =
+    typeof (window as any).Capacitor !== 'undefined' &&
+    Boolean((window as any).Capacitor?.isNativePlatform?.());
+
+  return resolveApiBaseUrl({
+    explicitApiUrl,
+    isNativePlatform: Capacitor.isNativePlatform() || nativeWindowCap,
+    platform: Capacitor.getPlatform(),
+    origin: window.location.origin || '',
+    hostname: window.location.hostname || '',
+    port: window.location.port || '',
+  });
 })();
 
 /**

@@ -43,14 +43,15 @@ describe('passkeyHelper', () => {
     expect(cfg.expectedOrigins).toContain('https://ais-dev-example.asia-southeast1.run.app');
   });
 
-  it('resolves rpID smartrun.in for native Android Capacitor requests', () => {
+  it('resolves rpID smartrun.in for native Android Capacitor requests (app.smartrun.in)', () => {
     const cfg = resolveWebAuthnRpConfig({
       host: 'www.smartrun.in',
-      origin: 'https://localhost',
+      origin: 'https://app.smartrun.in',
       isNativeAndroid: true,
     });
     expect(cfg.rpID).toBe('smartrun.in');
     expect(cfg.expectedRPIDs).toContain('smartrun.in');
+    expect(cfg.expectedOrigins).toContain('https://app.smartrun.in');
     expect(cfg.expectedOrigins.some((o) => o.startsWith('android:apk-key-hash:'))).toBe(true);
   });
 

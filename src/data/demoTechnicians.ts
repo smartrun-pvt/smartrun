@@ -25,7 +25,7 @@ export const DEMO_TECHNICIANS: Technician[] = [
     status: 'available',
     statusText: 'Available for site visits today',
     phone: '+91 98302 44120',
-    email: 'rajesh.mukherjee@girirajpower.com',
+    email: 'rajesh.mukherjee@smartrun.in',
     whatsapp: '+919830244120',
     emergencySupport: true,
     serviceAreas: [
@@ -143,7 +143,7 @@ export const DEMO_TECHNICIANS: Technician[] = [
     status: 'on_duty',
     statusText: 'On site in Sector V (Available from 03:00 PM)',
     phone: '+91 98311 77390',
-    email: 'subhashis.das@girirajpower.com',
+    email: 'subhashis.das@smartrun.in',
     whatsapp: '+919831177390',
     emergencySupport: true,
     serviceAreas: [
@@ -217,7 +217,7 @@ export const DEMO_TECHNICIANS: Technician[] = [
     status: 'available',
     statusText: 'Available today for solar site survey',
     phone: '+91 98320 88214',
-    email: 'amitava.sen@girirajpower.com',
+    email: 'amitava.sen@smartrun.in',
     whatsapp: '+919832088214',
     emergencySupport: false,
     serviceAreas: [
@@ -292,7 +292,7 @@ export const DEMO_TECHNICIANS: Technician[] = [
     status: 'available',
     statusText: 'On Emergency Standby (30-min response)',
     phone: '+91 98300 55921',
-    email: 'sandip.banerjee@girirajpower.com',
+    email: 'sandip.banerjee@smartrun.in',
     whatsapp: '+919830055921',
     emergencySupport: true,
     serviceAreas: [

@@ -25,4 +25,25 @@ describe('shareProduct canonical link builder', () => {
     expect(url.startsWith(`${PRODUCTION_WEB_DOMAIN}/electrical/product/wire%2Fred%202.5`)).toBe(true);
     expect(url).toContain('utm_campaign=product_share');
   });
+
+  test('rewrites app.smartrun.in, localhost, firebaseapp.com, and girirajpower.in URLs to https://www.smartrun.in', () => {
+    const inputs = [
+      'https://app.smartrun.in/electrical/product/p-1',
+      'https://localhost/electrical/product/p-1',
+      'https://gen-lang-client-0708778333.firebaseapp.com/electrical/product/p-1',
+      'https://www.girirajpower.in/electrical/product/p-1',
+    ];
+    for (const rawUrl of inputs) {
+      const result = buildTrackedShareUrl({
+        id: 'p-1',
+        name: 'Polycab Wire',
+        url: rawUrl,
+      });
+      expect(result.startsWith('https://www.smartrun.in/electrical/product/p-1')).toBe(true);
+      expect(result).not.toContain('localhost');
+      expect(result).not.toContain('app.smartrun.in');
+      expect(result).not.toContain('firebaseapp.com');
+      expect(result).not.toContain('girirajpower');
+    }
+  });
 });

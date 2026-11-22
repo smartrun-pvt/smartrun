@@ -51,15 +51,24 @@ export function buildTrackedShareUrl(options: ShareProductOptions): string {
     ? `/construction/product/${encodedId}`
     : `/electrical/product/${encodedId}`;
 
-  // If options.url is provided, sanitize it so it doesn't contain localhost
+  // If options.url is provided, sanitize it so shared links ALWAYS resolve to https://www.smartrun.in
   let targetUrl = options.url;
   if (targetUrl) {
-    if (
-      targetUrl.includes('localhost') ||
-      targetUrl.startsWith('capacitor://') ||
-      targetUrl.startsWith('ionic://') ||
-      targetUrl.startsWith('file://')
-    ) {
+    const lowerUrl = targetUrl.toLowerCase();
+    const needsCanonicalRewrite =
+      lowerUrl.includes('localhost') ||
+      lowerUrl.includes('127.0.0.1') ||
+      lowerUrl.includes('10.0.2.2') ||
+      lowerUrl.includes('app.smartrun.in') ||
+      lowerUrl.includes('.run.app') ||
+      lowerUrl.includes('.firebaseapp.com') ||
+      lowerUrl.includes('.web.app') ||
+      lowerUrl.includes('girirajpower') ||
+      lowerUrl.startsWith('capacitor://') ||
+      lowerUrl.startsWith('ionic://') ||
+      lowerUrl.startsWith('file://');
+
+    if (needsCanonicalRewrite) {
       try {
         const parsed = new URL(targetUrl, publicOrigin);
         targetUrl = `${publicOrigin}${parsed.pathname}${parsed.search}`;

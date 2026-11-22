@@ -8,9 +8,11 @@ const config: CapacitorConfig = {
     webContentsDebuggingEnabled: false,
   },
   server: {
+    hostname: 'app.smartrun.in',
     androidScheme: 'https',
     cleartext: false,
     allowNavigation: [
+      'app.smartrun.in',
       'www.smartrun.in',
       'smartrun.in',
       '*.razorpay.com',

@@ -15,9 +15,13 @@ export function isAndroidAppEnvironment(): boolean {
     }
   } catch {}
 
-  // 2. Capacitor custom scheme origin (inside native wrapper only)
+  // 2. Capacitor custom scheme or dedicated APK WebView hostname (https://app.smartrun.in)
   try {
-    if (window.location.protocol === 'capacitor:' || window.location.protocol === 'ionic:') {
+    if (
+      window.location.protocol === 'capacitor:' ||
+      window.location.protocol === 'ionic:' ||
+      window.location.hostname.toLowerCase() === 'app.smartrun.in'
+    ) {
       return true;
     }
   } catch {}

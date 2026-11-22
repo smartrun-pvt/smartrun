@@ -1,5 +1,6 @@
 export const PRODUCTION_APP_ORIGIN = 'https://www.smartrun.in';
 export const PRODUCTION_FIREBASE_AUTH_DOMAIN = 'www.smartrun.in';
+export const CAPACITOR_APK_HOSTNAME = 'app.smartrun.in';
 
 export interface AuthDomainResolutionContext {
   configuredDomain?: string;
@@ -29,6 +30,24 @@ export function normalizeAuthDomainHostname(rawDomain: string): string {
     .toLowerCase();
 }
 
+export function isSmartRunHost(hostname?: string): boolean {
+  const host = String(hostname || '').trim().toLowerCase();
+  return host === 'smartrun.in' || host === 'www.smartrun.in' || host.endsWith('.smartrun.in');
+}
+
+function isDisallowedProdAuthDomain(domain: string): boolean {
+  const host = normalizeAuthDomainHostname(domain);
+  return (
+    !host ||
+    host === 'localhost' ||
+    host === '127.0.0.1' ||
+    host === '10.0.2.2' ||
+    host.endsWith('.firebaseapp.com') ||
+    host.endsWith('.web.app') ||
+    host.includes('girirajpower')
+  );
+}
+
 /**
  * Resolves the canonical public SmartRun origin (`https://www.smartrun.in`) for
  * redirects, password reset links, OAuth callbacks, and share URLs across
@@ -48,9 +67,7 @@ export function resolvePublicAppOrigin(ctx?: PublicOriginContext): string {
     host === 'localhost' ||
     host === '127.0.0.1' ||
     host === '10.0.2.2' ||
-    host === 'smartrun.in' ||
-    host === 'www.smartrun.in' ||
-    host.endsWith('.smartrun.in') ||
+    isSmartRunHost(host) ||
     host.includes('girirajpower') ||
     host.endsWith('.firebaseapp.com') ||
     host.endsWith('.run.app')
@@ -62,26 +79,42 @@ export function resolvePublicAppOrigin(ctx?: PublicOriginContext): string {
 }
 
 /**
- * Resolves the Firebase Auth domain so production web and native Android/iOS APK
- * builds always use the canonical public SmartRun domain (`www.smartrun.in`)
- * rather than the default Firebase subdomain (`*.firebaseapp.com`) or `localhost`.
+ * Resolves the Firebase Auth domain so production web (`smartrun.in`, `www.smartrun.in`)
+ * and native Android/iOS APK builds (`app.smartrun.in`) always use the canonical public
+ * SmartRun domain (`www.smartrun.in`) rather than `*.firebaseapp.com` or `localhost`.
  */
 export function resolveFirebaseAuthDomainForEnv(ctx: AuthDomainResolutionContext): string {
+  const host = String(ctx.windowHostname || '').trim().toLowerCase();
+  const isProdOrNative = Boolean(ctx.isNativePlatform) || isSmartRunHost(host);
+
   const configured = normalizeAuthDomainHostname(ctx.configuredDomain || '');
   if (configured) {
+    // Reject localhost / firebaseapp.com / legacy domain overrides on native APK or smartrun.in
+    if (isProdOrNative && isDisallowedProdAuthDomain(configured)) {
+      return PRODUCTION_FIREBASE_AUTH_DOMAIN;
+    }
     return configured;
   }
 
-  if (ctx.isNativePlatform) {
-    return PRODUCTION_FIREBASE_AUTH_DOMAIN;
-  }
-
-  const host = String(ctx.windowHostname || '').trim().toLowerCase();
-  if (host === 'smartrun.in' || host === 'www.smartrun.in') {
+  if (isProdOrNative) {
     return PRODUCTION_FIREBASE_AUTH_DOMAIN;
   }
 
   return normalizeAuthDomainHostname(ctx.fallbackAuthDomain) || PRODUCTION_FIREBASE_AUTH_DOMAIN;
+}
+
+/**
+ * Returns false on native APK and production smartrun.in domains so Firebase Phone Auth
+ * never silently falls back to `*.firebaseapp.com` in production.
+ * Only permits the project fallback authDomain on local dev / Cloud Run preview hosts.
+ */
+export function shouldAllowFallbackFirebaseAuthDomain(ctx: {
+  isNativePlatform: boolean;
+  windowHostname?: string;
+}): boolean {
+  if (ctx.isNativePlatform) return false;
+  if (isSmartRunHost(ctx.windowHostname)) return false;
+  return true;
 }
 
 /**

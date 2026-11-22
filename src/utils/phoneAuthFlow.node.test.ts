@@ -1,6 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  PRODUCTION_APP_ORIGIN,
+  PRODUCTION_FIREBASE_AUTH_DOMAIN,
+  CAPACITOR_APK_HOSTNAME,
+  resolvePublicAppOrigin,
+  resolveFirebaseAuthDomainForEnv,
+  shouldAllowFallbackFirebaseAuthDomain,
   parseIndianMobileNumber,
   shouldResetOtpSessionOnIdentifierChange,
   shouldRestorePendingOtpSession,
@@ -11,6 +17,8 @@ import {
   isRecaptchaAlreadyRenderedError,
 } from './firebaseAuthDomain';
 import { extractOtpDigits } from './otpAutofill';
+import { resolveWebAuthnRpConfig } from './passkeyHelper';
+import { resolveApiBaseUrl } from '../lib/apiBase';
 
 test('parseIndianMobileNumber accepts valid Indian formats and rejects overlong/invalid inputs', () => {
   assert.deepEqual(parseIndianMobileNumber('9876543210'), {
@@ -135,4 +143,97 @@ test('OTP error classification and SMS digit extraction behave accurately', () =
     isRecaptchaAlreadyRenderedError(new Error('reCAPTCHA has already been rendered in this element')),
     true
   );
+});
+
+test('APK and production web strictly enforce smartrun.in (never localhost or firebaseapp.com)', () => {
+  assert.equal(PRODUCTION_APP_ORIGIN, 'https://www.smartrun.in');
+  assert.equal(PRODUCTION_FIREBASE_AUTH_DOMAIN, 'www.smartrun.in');
+  assert.equal(CAPACITOR_APK_HOSTNAME, 'app.smartrun.in');
+
+  // APK running on https://app.smartrun.in must call https://www.smartrun.in/api/*
+  assert.equal(
+    resolveApiBaseUrl({
+      isNativePlatform: true,
+      platform: 'android',
+      origin: 'https://app.smartrun.in',
+      hostname: 'app.smartrun.in',
+    }),
+    'https://www.smartrun.in'
+  );
+
+  // Even if an accidental localhost env var is passed into an APK build, it is blocked
+  assert.equal(
+    resolveApiBaseUrl({
+      explicitApiUrl: 'http://localhost:3000',
+      isNativePlatform: true,
+      platform: 'android',
+      origin: 'https://app.smartrun.in',
+      hostname: 'app.smartrun.in',
+    }),
+    'https://www.smartrun.in'
+  );
+
+  // Live smartrun.in web uses relative same-origin API routes (never localhost)
+  assert.equal(
+    resolveApiBaseUrl({
+      explicitApiUrl: 'http://localhost:3000',
+      isNativePlatform: false,
+      platform: 'web',
+      origin: 'https://www.smartrun.in',
+      hostname: 'www.smartrun.in',
+    }),
+    ''
+  );
+
+  // Firebase authDomain must resolve to www.smartrun.in on APK and smartrun.in hosts
+  assert.equal(
+    resolveFirebaseAuthDomainForEnv({
+      configuredDomain: 'localhost',
+      isNativePlatform: true,
+      windowHostname: 'app.smartrun.in',
+      fallbackAuthDomain: 'gen-lang-client-0708778333.firebaseapp.com',
+    }),
+    'www.smartrun.in'
+  );
+  assert.equal(
+    resolveFirebaseAuthDomainForEnv({
+      configuredDomain: '',
+      isNativePlatform: false,
+      windowHostname: 'smartrun.in',
+      fallbackAuthDomain: 'gen-lang-client-0708778333.firebaseapp.com',
+    }),
+    'www.smartrun.in'
+  );
+  assert.equal(
+    shouldAllowFallbackFirebaseAuthDomain({ isNativePlatform: true, windowHostname: 'app.smartrun.in' }),
+    false
+  );
+  assert.equal(
+    shouldAllowFallbackFirebaseAuthDomain({ isNativePlatform: false, windowHostname: 'www.smartrun.in' }),
+    false
+  );
+  assert.equal(
+    shouldAllowFallbackFirebaseAuthDomain({ isNativePlatform: false, windowHostname: 'localhost' }),
+    true
+  );
+
+  // Public origin always resolves to https://www.smartrun.in
+  assert.equal(
+    resolvePublicAppOrigin({
+      isNativePlatform: true,
+      windowOrigin: 'https://app.smartrun.in',
+      windowHostname: 'app.smartrun.in',
+    }),
+    'https://www.smartrun.in'
+  );
+
+  // Passkeys from APK https://app.smartrun.in resolve rpID smartrun.in
+  const rp = resolveWebAuthnRpConfig({
+    host: 'www.smartrun.in',
+    origin: 'https://app.smartrun.in',
+    isNativeAndroid: true,
+  });
+  assert.equal(rp.rpID, 'smartrun.in');
+  assert.ok(rp.expectedOrigins.includes('https://app.smartrun.in'));
+  assert.ok(rp.expectedOrigins.includes('https://www.smartrun.in'));
 });

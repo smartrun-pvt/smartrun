@@ -24,7 +24,7 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
 
-            <!-- Custom URL Scheme Deep Links: smartrun://, in.smartrun.app://, and buildnow:// -->
+            <!-- Custom URL Scheme Deep Links: smartrun:// and in.smartrun.app:// -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
@@ -37,12 +37,6 @@
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="in.smartrun.app" />
             </intent-filter>
-            <intent-filter>
-                <action android:name="android.intent.action.VIEW" />
-                <category android:name="android.intent.category.DEFAULT" />
-                <category android:name="android.intent.category.BROWSABLE" />
-                <data android:scheme="buildnow" />
-            </intent-filter>
 
             <!-- Primary Verified HTTPS App Links for SmartRun -->
             <intent-filter android:autoVerify="true">
@@ -51,15 +45,6 @@
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="https" android:host="smartrun.in" />
                 <data android:scheme="https" android:host="www.smartrun.in" />
-            </intent-filter>
-
-            <!-- Legacy Domain Compatibility (isolated from autoVerify so Android 12+ verification for smartrun.in is never invalidated) -->
-            <intent-filter>
-                <action android:name="android.intent.action.VIEW" />
-                <category android:name="android.intent.category.DEFAULT" />
-                <category android:name="android.intent.category.BROWSABLE" />
-                <data android:scheme="https" android:host="www.girirajpower.in" />
-                <data android:scheme="https" android:host="girirajpower.in" />
             </intent-filter>
 
         </activity>

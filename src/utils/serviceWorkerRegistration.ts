@@ -43,7 +43,11 @@ export function registerServiceWorker() {
     return;
   }
 
-  if (!('serviceWorker' in navigator) || Capacitor.isNativePlatform()) {
+  if (
+    !('serviceWorker' in navigator) ||
+    Capacitor.isNativePlatform() ||
+    window.location.hostname.toLowerCase() === 'app.smartrun.in'
+  ) {
     return;
   }
 

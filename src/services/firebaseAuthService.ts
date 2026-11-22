@@ -26,6 +26,7 @@ import { sanitizeCustomerName } from '../utils/nameHelper';
 import {
   PRODUCTION_FIREBASE_AUTH_DOMAIN,
   resolveFirebaseAuthDomainForEnv,
+  shouldAllowFallbackFirebaseAuthDomain,
   buildRecaptchaSlotId,
   isRecaptchaAlreadyRenderedError,
   normalizeNativeFirebaseAuthError,
@@ -914,8 +915,9 @@ export async function sendFirebasePhoneOtp(
       }
     }
 
-    // If custom authDomain (smartrun.in / www.smartrun.in) failed due to domain/reCAPTCHA config,
-    // automatically retry once with default Firebase authDomain on a fresh virgin slot.
+    // Only fall back to default Firebase authDomain on local dev / preview hosts.
+    // On production smartrun.in / www.smartrun.in / native APK, strictly enforce smartrun.in
+    // so users never see or route through *.firebaseapp.com.
     const errCode = String(webErr?.code || '');
     const errMsg = String(webErr?.message || '').toLowerCase();
     const isDomainOrCaptchaErr =
@@ -926,9 +928,18 @@ export async function sendFirebasePhoneOtp(
       errMsg.includes('hostname match not found') ||
       errMsg.includes('recaptcha');
 
-    if (isDomainOrCaptchaErr && resolvedFirebaseConfig.authDomain !== firebaseConfig.authDomain) {
+    const canFallbackAuthDomain = shouldAllowFallbackFirebaseAuthDomain({
+      isNativePlatform: Capacitor.isNativePlatform(),
+      windowHostname: typeof window !== 'undefined' ? window.location.hostname : '',
+    });
+
+    if (
+      canFallbackAuthDomain &&
+      isDomainOrCaptchaErr &&
+      resolvedFirebaseConfig.authDomain !== firebaseConfig.authDomain
+    ) {
       try {
-        console.log('[Firebase Phone Auth] Retrying Web SDK OTP with fallback Firebase authDomain...');
+        console.log('[Firebase Phone Auth] Retrying Web SDK OTP with dev preview fallback authDomain...');
         return await attemptWebFirebaseSend(getFallbackFirebaseAuth(), true);
       } catch (retryErr: any) {
         console.warn('[Firebase Phone Auth] Fallback authDomain retry also failed:', retryErr);

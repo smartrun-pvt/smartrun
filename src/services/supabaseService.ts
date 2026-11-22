@@ -701,6 +701,7 @@ export async function signInWithGoogle(): Promise<{ error: Error | null; url?: s
         try {
           const resolveRes = await fetch(apiUrl('/api/auth/resolve-google-user'), {
             method: 'POST',
+            credentials: 'include',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               email: googleEmail,

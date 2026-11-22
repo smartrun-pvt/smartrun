@@ -8,6 +8,7 @@ export const PRODUCTION_RP_ID = 'smartrun.in';
 export const PRODUCTION_WEB_ORIGINS = [
   'https://www.smartrun.in',
   'https://smartrun.in',
+  'https://app.smartrun.in',
 ] as const;
 
 /**
@@ -133,6 +134,7 @@ export function resolveWebAuthnRpConfig(params: ResolveWebAuthnRpParams): Resolv
   const parsedOrigin = parseHostnameFromOrigin(params.origin);
   const rawOrigin = String(params.origin || '').trim();
   const isCapacitorWebViewOrigin =
+    rawOrigin === 'https://app.smartrun.in' ||
     rawOrigin === 'https://localhost' ||
     rawOrigin === 'http://localhost' ||
     rawOrigin.startsWith('capacitor://') ||
