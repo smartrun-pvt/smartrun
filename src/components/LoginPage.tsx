@@ -1751,7 +1751,7 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
                       )}
                     </div>
 
-                    <div className="flex justify-between items-center pt-2">
+                    <div className="flex justify-between items-center gap-2 pt-2.5">
                       <button
                         type="button"
                         onClick={() => {
@@ -1766,27 +1766,28 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
                           setOtpCode('');
                           resetMessages();
                         }}
-                        className="text-xs font-semibold text-slate-500 hover:text-slate-800 transition-colors cursor-pointer"
+                        className="text-xs font-semibold text-slate-500 hover:text-slate-800 transition-colors cursor-pointer whitespace-nowrap shrink-0"
                       >
                         Change number
                       </button>
 
-                      <div className="flex items-center gap-1.5">
-                        <span className="text-xs font-semibold text-emerald-600">
-                          Otp Sent..
+                      <div className="flex items-center gap-2 shrink-0">
+                        <span className="inline-flex items-center gap-1 text-xs font-semibold text-emerald-600 whitespace-nowrap">
+                          <CheckCircle2 className="w-3.5 h-3.5 shrink-0 text-emerald-500" />
+                          <span>OTP Sent</span>
                         </span>
-                        <span className="text-slate-300">•</span>
+                        <span aria-hidden="true" className="h-3 w-px bg-slate-200 shrink-0" />
                         <button
                           type="button"
                           onClick={handleSendPhoneOtp}
                           disabled={otpCooldown > 0 || isLoading}
-                          className={`text-xs transition-colors ${
+                          className={`text-xs whitespace-nowrap tabular-nums transition-colors ${
                             otpCooldown > 0 || isLoading
-                              ? 'text-slate-400 font-medium cursor-not-allowed'
-                              : 'text-amber-700 hover:text-amber-800 font-bold cursor-pointer'
+                              ? 'text-slate-400 font-semibold cursor-not-allowed'
+                              : 'text-amber-600 hover:text-amber-700 font-bold underline underline-offset-2 decoration-amber-400/70 cursor-pointer'
                           }`}
                         >
-                          {otpCooldown > 0 ? `Resend OTP (${otpCooldown}s)` : 'Resend OTP'}
+                          {otpCooldown > 0 ? `Resend (${otpCooldown}s)` : 'Resend'}
                         </button>
                       </div>
                     </div>
