@@ -3,14 +3,17 @@ FROM node:22-alpine AS builder
 
 WORKDIR /app
 
-# Copy dependency manifests
-COPY package.json package-lock.json* ./
+# Copy dependency manifests (package-lock.json required for deterministic npm ci)
+COPY package.json package-lock.json ./
 
-# Install dependencies (including devDependencies required for vite build and esbuild)
-RUN npm install
+# Install dependencies deterministically without running lifecycle/postinstall scripts
+RUN npm ci --ignore-scripts
 
 # Copy source files
 COPY . .
+
+# Note: scripts/patch-capacitor-android.mjs only patches Android Java sources under
+# node_modules/@capacitor* and is not needed for the web/Cloud Run Node.js build.
 
 # Build Vite client and bundle server.ts -> dist/server.cjs
 RUN npm run build
@@ -23,11 +26,11 @@ WORKDIR /app
 ENV NODE_ENV=production
 ENV PORT=8080
 
-# Copy package manifest
-COPY package.json ./
+# Copy package manifests including lockfile for deterministic production install
+COPY package.json package-lock.json ./
 
-# Install only production dependencies
-RUN npm install --omit=dev
+# Install only production dependencies without running lifecycle/postinstall scripts
+RUN npm ci --omit=dev --ignore-scripts
 
 # Copy built distribution bundle from builder stage
 COPY --from=builder /app/dist ./dist

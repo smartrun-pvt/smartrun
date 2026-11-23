@@ -6,6 +6,19 @@ import {
   resolveServerUnitPrice,
   resolveAuthoritativeOrderItems,
   verifyRazorpayOrderPaymentStatus,
+  verifyRazorpayWebhookSignature,
+  timingSafeStringEqual,
+  parseAdminEmailsEnv,
+  resolveEmailOtpSecret,
+  computeEmailOtpHash,
+  verifyEmailOtpHash,
+  getAllowedUserIds,
+  validateLatLng,
+  mergeDeliveryPartnerLocation,
+  parseOptionalRefundAmount,
+  isTestRefundPayment,
+  isSimulatedRefundAllowed,
+  validateNonAdminRefundRequest,
 } from "./orderSecurity";
 
 test("resolveAuthoritativeOrderItems ignores tampered client prices and uses DB product price", () => {
@@ -227,3 +240,313 @@ test("verifyRazorpayOrderPaymentStatus returns 'paid' ONLY for verified upi/card
     "pending"
   );
 });
+
+test("verifyRazorpayWebhookSignature verifies exact rawBody bytes using HMAC-SHA256 and rejects missing/tampered inputs", () => {
+  const webhookSecret = "whsec_live_test_secret_987654";
+  // Pretty-printed JSON with extra spaces & key ordering that JSON.stringify(req.body) would alter
+  const rawPayloadStr = '{\n  "event": "payment.captured",\n  "payload": { "payment": { "entity": { "id": "pay_123", "order_id": "order_456" } } }\n}';
+  const rawBody = Buffer.from(rawPayloadStr, "utf8");
+  const validSig = crypto
+    .createHmac("sha256", webhookSecret)
+    .update(rawBody)
+    .digest("hex");
+
+  // Matches exact rawBody buffer (even when JSON.stringify would produce different bytes)
+  const reserializedSig = crypto
+    .createHmac("sha256", webhookSecret)
+    .update(JSON.stringify(JSON.parse(rawPayloadStr)))
+    .digest("hex");
+  assert.notEqual(validSig, reserializedSig);
+
+  assert.equal(
+    verifyRazorpayWebhookSignature({
+      rawBody,
+      signature: validSig,
+      webhookSecret,
+    }),
+    true
+  );
+
+  // Uppercase hex signature still validates cleanly
+  assert.equal(
+    verifyRazorpayWebhookSignature({
+      rawBody,
+      signature: validSig.toUpperCase(),
+      webhookSecret,
+    }),
+    true
+  );
+
+  // Signature computed over JSON.stringify(parsed) MUST fail against rawBody
+  assert.equal(
+    verifyRazorpayWebhookSignature({
+      rawBody,
+      signature: reserializedSig,
+      webhookSecret,
+    }),
+    false
+  );
+
+  // Tampered single char fails
+  const tamperedSig = (validSig[0] === "0" ? "1" : "0") + validSig.slice(1);
+  assert.equal(
+    verifyRazorpayWebhookSignature({
+      rawBody,
+      signature: tamperedSig,
+      webhookSecret,
+    }),
+    false
+  );
+
+  // Missing secret, missing signature, array header, wrong length, or empty rawBody all fail
+  assert.equal(
+    verifyRazorpayWebhookSignature({ rawBody, signature: validSig, webhookSecret: "" }),
+    false
+  );
+  assert.equal(
+    verifyRazorpayWebhookSignature({ rawBody, signature: undefined, webhookSecret }),
+    false
+  );
+  assert.equal(
+    verifyRazorpayWebhookSignature({ rawBody, signature: [validSig], webhookSecret }),
+    false
+  );
+  assert.equal(
+    verifyRazorpayWebhookSignature({ rawBody, signature: "shorthex", webhookSecret }),
+    false
+  );
+  assert.equal(
+    verifyRazorpayWebhookSignature({ rawBody: Buffer.alloc(0), signature: validSig, webhookSecret }),
+    false
+  );
+});
+
+test("timingSafeStringEqual compares secrets in constant time with length and type guards", () => {
+  assert.equal(timingSafeStringEqual("my-super-secret", "my-super-secret"), true);
+  assert.equal(timingSafeStringEqual("my-super-secre1", "my-super-secret"), false);
+  assert.equal(timingSafeStringEqual("short", "my-super-secret"), false);
+  assert.equal(timingSafeStringEqual("", ""), false);
+  assert.equal(timingSafeStringEqual(["my-super-secret"], "my-super-secret"), false);
+  assert.equal(timingSafeStringEqual(undefined, "my-super-secret"), false);
+});
+
+test("parseAdminEmailsEnv parses comma-separated env emails with zero hardcoded defaults", () => {
+  assert.deepEqual(parseAdminEmailsEnv(undefined), []);
+  assert.deepEqual(parseAdminEmailsEnv(""), []);
+  assert.deepEqual(
+    parseAdminEmailsEnv(" Ops@SmartRun.in , alerts@smartrun.in, ops@smartrun.in, not-an-email "),
+    ["ops@smartrun.in", "alerts@smartrun.in"]
+  );
+});
+
+test("resolveEmailOtpSecret requires API_SECRET_KEY or SESSION_SECRET with no hardcoded fallback", () => {
+  assert.equal(resolveEmailOtpSecret({}), null);
+  assert.equal(resolveEmailOtpSecret({ API_SECRET_KEY: "   ", SESSION_SECRET: "" }), null);
+  assert.equal(resolveEmailOtpSecret({ SESSION_SECRET: "sess_123" }), "sess_123");
+  assert.equal(
+    resolveEmailOtpSecret({ API_SECRET_KEY: "api_999", SESSION_SECRET: "sess_123" }),
+    "api_999"
+  );
+});
+
+test("computeEmailOtpHash and verifyEmailOtpHash verify server-side OTP hashes safely", () => {
+  const secret = "server_only_hmac_secret_2026";
+  const hash = computeEmailOtpHash("User@Example.com", "482913", secret);
+  assert.match(hash, /^[a-f0-9]{64}$/);
+  assert.equal(hash.includes("482913"), false);
+
+  assert.equal(verifyEmailOtpHash("user@example.com", "482913", hash, secret), true);
+  assert.equal(verifyEmailOtpHash("user@example.com", "482914", hash, secret), false);
+  assert.equal(verifyEmailOtpHash("other@example.com", "482913", hash, secret), false);
+  assert.equal(verifyEmailOtpHash("user@example.com", "482913", hash, "wrong_secret"), false);
+  assert.equal(verifyEmailOtpHash("user@example.com", "482913", "not-hex", secret), false);
+});
+
+test("getAllowedUserIds collects id, master_user_id, and linked_user_id deduplicated", () => {
+  assert.deepEqual(getAllowedUserIds(null), []);
+  assert.deepEqual(
+    getAllowedUserIds({
+      id: "uid-primary",
+      user_metadata: {
+        master_user_id: "uid-master",
+        linked_user_id: "uid-primary",
+      },
+    }),
+    ["uid-primary", "uid-master"]
+  );
+});
+
+test("validateLatLng accepts valid Earth coordinates and rejects out-of-range or non-numeric values", () => {
+  assert.deepEqual(validateLatLng(22.5179, 88.3834), { valid: true, lat: 22.5179, lng: 88.3834 });
+  assert.deepEqual(validateLatLng("-90", "180"), { valid: true, lat: -90, lng: 180 });
+  assert.equal(validateLatLng(91, 88.38).valid, false);
+  assert.equal(validateLatLng(-90.1, 88.38).valid, false);
+  assert.equal(validateLatLng(22.5, 181).valid, false);
+  assert.equal(validateLatLng(22.5, -180.5).valid, false);
+  assert.equal(validateLatLng(NaN, 88.38).valid, false);
+  assert.equal(validateLatLng(Infinity, 88.38).valid, false);
+  assert.equal(validateLatLng("", 88.38).valid, false);
+  assert.equal(validateLatLng(true, 88.38).valid, false);
+});
+
+test("mergeDeliveryPartnerLocation preserves phone, vehicleNumber, and existing rider metadata", () => {
+  const existing = {
+    name: "Ramesh Das",
+    phone: "+91 98300 11223",
+    vehicleNumber: "WB 02 AR 4491",
+    rating: 4.9,
+    currentHub: "Kasba Warehouse",
+  };
+  const gpsRecord = {
+    orderId: "ord-1",
+    lat: 22.52,
+    lng: 88.39,
+    riderName: "Delivery Partner",
+    updatedAt: "2026-11-23T12:00:00.000Z",
+  };
+
+  const merged = mergeDeliveryPartnerLocation(existing, gpsRecord);
+  assert.equal(merged.name, "Ramesh Das");
+  assert.equal(merged.phone, "+91 98300 11223");
+  assert.equal(merged.vehicleNumber, "WB 02 AR 4491");
+  assert.equal(merged.rating, 4.9);
+  assert.equal(merged.currentHub, "Kasba Warehouse");
+  assert.equal(merged.lat, 22.52);
+  assert.equal(merged.lng, 88.39);
+  assert.deepEqual(merged.current_location, gpsRecord);
+
+  // Explicit non-generic riderName updates name while keeping phone & vehicleNumber
+  const mergedNamed = mergeDeliveryPartnerLocation(existing, {
+    ...gpsRecord,
+    riderName: "Suman Roy",
+  });
+  assert.equal(mergedNamed.name, "Suman Roy");
+  assert.equal(mergedNamed.phone, "+91 98300 11223");
+  assert.equal(mergedNamed.vehicleNumber, "WB 02 AR 4491");
+});
+
+test("parseOptionalRefundAmount validates optional positive refund amounts strictly", () => {
+  assert.deepEqual(parseOptionalRefundAmount(undefined), { ok: true, amount: undefined });
+  assert.deepEqual(parseOptionalRefundAmount(""), { ok: true, amount: undefined });
+  assert.deepEqual(parseOptionalRefundAmount(499.5), { ok: true, amount: 499.5 });
+  assert.deepEqual(parseOptionalRefundAmount("1200"), { ok: true, amount: 1200 });
+
+  assert.equal(parseOptionalRefundAmount(0).ok, false);
+  assert.equal(parseOptionalRefundAmount(-50).ok, false);
+  assert.equal(parseOptionalRefundAmount(NaN).ok, false);
+  assert.equal(parseOptionalRefundAmount(Infinity).ok, false);
+  assert.equal(parseOptionalRefundAmount(true).ok, false);
+  assert.equal(parseOptionalRefundAmount("abc").ok, false);
+});
+
+test("isTestRefundPayment and isSimulatedRefundAllowed block simulations in production and for real payment IDs", () => {
+  assert.equal(isTestRefundPayment("pay_test_123", "ord_1"), true);
+  assert.equal(isTestRefundPayment("test_abc", "ord_1"), true);
+  assert.equal(isTestRefundPayment("", "order_test_99"), true);
+  // Real-looking payment ID must NEVER be classified as a test payment even with order_test_ prefix
+  assert.equal(isTestRefundPayment("pay_RealLive987654", "order_test_99"), false);
+  assert.equal(isTestRefundPayment("pay_RealLive987654", "ord_1"), false);
+
+  // Production ALWAYS blocks simulated refunds
+  assert.equal(
+    isSimulatedRefundAllowed({ nodeEnv: "production", isTestPayment: true, razorpayKeyId: "rzp_test_123" }),
+    false
+  );
+  assert.equal(
+    isSimulatedRefundAllowed({ nodeEnv: "production", isTestPayment: false, razorpayKeyId: "" }),
+    false
+  );
+  // Live Razorpay key blocks simulated refunds even outside production
+  assert.equal(
+    isSimulatedRefundAllowed({ nodeEnv: "development", isTestPayment: true, razorpayKeyId: "rzp_live_abc" }),
+    false
+  );
+  // Development with real-looking payment ID blocks simulated refunds
+  assert.equal(
+    isSimulatedRefundAllowed({ nodeEnv: "development", isTestPayment: false, razorpayKeyId: "" }),
+    false
+  );
+  // Development with explicit test payment and non-live key allows simulation
+  assert.equal(
+    isSimulatedRefundAllowed({ nodeEnv: "development", isTestPayment: true, razorpayKeyId: "rzp_test_123" }),
+    true
+  );
+});
+
+test("validateNonAdminRefundRequest enforces order existence, ownership, payment_id match, and total_amount cap", () => {
+  const authUser = {
+    id: "user-1",
+    user_metadata: { master_user_id: "user-master-1" },
+  };
+  const baseOrder = {
+    id: "ord-uuid-1",
+    user_id: "user-1",
+    payment_id: "pay_LiveAbc123",
+    total_amount: 1650,
+  };
+
+  // Missing order -> 404
+  const missing = validateNonAdminRefundRequest({
+    order: null,
+    authUser,
+    paymentId: "pay_LiveAbc123",
+    requestedAmount: 1650,
+  });
+  assert.equal(missing.ok, false);
+  if (!missing.ok) assert.equal(missing.status, 404);
+
+  // Different owner -> 403
+  const wrongOwner = validateNonAdminRefundRequest({
+    order: { ...baseOrder, user_id: "other-user" },
+    authUser,
+    paymentId: "pay_LiveAbc123",
+    requestedAmount: 1650,
+  });
+  assert.equal(wrongOwner.ok, false);
+  if (!wrongOwner.ok) assert.equal(wrongOwner.status, 403);
+
+  // Mismatched payment_id -> 403
+  const wrongPayment = validateNonAdminRefundRequest({
+    order: baseOrder,
+    authUser,
+    paymentId: "pay_Different999",
+    requestedAmount: 1650,
+  });
+  assert.equal(wrongPayment.ok, false);
+  if (!wrongPayment.ok) assert.equal(wrongPayment.status, 403);
+
+  // Amount greater than order total -> 400
+  const overRefund = validateNonAdminRefundRequest({
+    order: baseOrder,
+    authUser,
+    paymentId: "pay_LiveAbc123",
+    requestedAmount: 1650.01,
+  });
+  assert.equal(overRefund.ok, false);
+  if (!overRefund.ok) assert.equal(overRefund.status, 400);
+
+  // Valid partial refund for primary user -> ok
+  const validPartial = validateNonAdminRefundRequest({
+    order: baseOrder,
+    authUser,
+    paymentId: "pay_LiveAbc123",
+    requestedAmount: 500,
+  });
+  assert.equal(validPartial.ok, true);
+  if (validPartial.ok) {
+    assert.equal(validPartial.effectiveAmount, 500);
+    assert.equal(validPartial.orderTotal, 1650);
+  }
+
+  // Valid full refund (omitted amount defaults to orderTotal) for linked master_user_id -> ok
+  const validMaster = validateNonAdminRefundRequest({
+    order: { ...baseOrder, user_id: "user-master-1", payment_id: null, razorpay_payment_id: "pay_LiveAbc123" },
+    authUser,
+    paymentId: "pay_LiveAbc123",
+  });
+  assert.equal(validMaster.ok, true);
+  if (validMaster.ok) {
+    assert.equal(validMaster.effectiveAmount, 1650);
+  }
+});
+

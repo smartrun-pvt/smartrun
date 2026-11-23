@@ -44,7 +44,20 @@ import {
 } from "./src/utils/passkeyHelper";
 import {
   resolveAuthoritativeOrderItems,
-  verifyRazorpayOrderPaymentStatus
+  verifyRazorpayOrderPaymentStatus,
+  verifyRazorpayWebhookSignature,
+  timingSafeStringEqual,
+  parseAdminEmailsEnv,
+  resolveEmailOtpSecret,
+  computeEmailOtpHash,
+  verifyEmailOtpHash,
+  getAllowedUserIds,
+  validateLatLng,
+  mergeDeliveryPartnerLocation,
+  parseOptionalRefundAmount,
+  isTestRefundPayment,
+  isSimulatedRefundAllowed,
+  validateNonAdminRefundRequest
 } from "./src/utils/orderSecurity";
 
 dotenv.config();
@@ -1174,11 +1187,7 @@ export function generateWelcomeEmailHtml(userName: string = "Customer"): string 
 const RESEND_INBOUND_DOMAIN = "oieldiakir.resend.app";
 const RESEND_INBOUND_EMAIL = process.env.RESEND_INBOUND_EMAIL || "orders@oieldiakir.resend.app";
 const OFFICIAL_EMAIL = process.env.RESEND_INBOUND_EMAIL || "orders@oieldiakir.resend.app";
-const ADMIN_EMAILS: string[] = [
-  "gauravgiri123344@gmail.com",
-  "mdhassan1738@gmail.com",
-  ...(process.env.ADMIN_EMAIL ? process.env.ADMIN_EMAIL.split(',').map(e => e.trim().toLowerCase()).filter(Boolean) : [])
-].filter((v, i, a) => a.indexOf(v) === i);
+const ADMIN_EMAILS: string[] = parseAdminEmailsEnv(process.env.ADMIN_EMAILS);
 const ADMIN_EMAIL = ADMIN_EMAILS.join(", ");
 const ADMIN_WHATSAPP_NUMBER = process.env.ADMIN_WHATSAPP_NUMBER || "918777400280";
 
@@ -1879,7 +1888,7 @@ const strictLimiter = rateLimit({
 
 // Middleware that reads process.env.API_SECRET_KEY and checks req.headers['x-api-key']
 function requireApiSecret(req: express.Request, res: express.Response, next: express.NextFunction) {
-  const secret = process.env.API_SECRET_KEY;
+  const secret = String(process.env.API_SECRET_KEY || "").trim();
   if (!secret) {
     return res.status(500).json({
       success: false,
@@ -1888,7 +1897,7 @@ function requireApiSecret(req: express.Request, res: express.Response, next: exp
   }
 
   const clientKey = req.headers["x-api-key"];
-  if (!clientKey || clientKey !== secret) {
+  if (!timingSafeStringEqual(clientKey, secret)) {
     return res.status(401).json({
       success: false,
       message: "Unauthorized: Invalid or missing API key."
@@ -2029,35 +2038,17 @@ async function getAuthenticatedUser(req: express.Request): Promise<any | null> {
   return null;
 }
 
-// Helper to check if a request is authenticated as an admin or with an API secret
+// Helper to check if a request carries a valid server-to-server API_SECRET_KEY (constant-time comparison).
+// Admin-user roles and spoofable x-admin-email / x-user-email headers are removed from the app.
 async function isAuthorizedAdminOrSecret(req: express.Request): Promise<boolean> {
-  const secret = process.env.API_SECRET_KEY;
-  const clientKey = (req.headers["x-api-key"] || req.headers["x-admin-key"] || "") as string;
-  if (secret && clientKey && clientKey === secret) {
+  const secret = String(process.env.API_SECRET_KEY || "").trim();
+  if (!secret) {
+    return false;
+  }
+
+  const clientKey = req.headers["x-api-key"] || req.headers["x-admin-key"];
+  if (timingSafeStringEqual(clientKey, secret)) {
     return true;
-  }
-
-  // Check Supabase Authorization: Bearer <token>
-  const authHeader = req.headers.authorization;
-  if (authHeader && authHeader.startsWith("Bearer ")) {
-    const token = authHeader.substring(7).trim();
-    const sb = getServerSupabase();
-    if (sb && token) {
-      try {
-        const { data: { user }, error } = await sb.auth.getUser(token);
-        if (!error && user && user.email && ADMIN_EMAILS.includes(user.email.toLowerCase())) {
-          return true;
-        }
-      } catch {}
-    }
-  }
-
-  // Check admin email header
-  const clientEmail = (req.headers["x-admin-email"] || req.headers["x-user-email"] || "") as string;
-  if (clientEmail && ADMIN_EMAILS.includes(clientEmail.trim().toLowerCase())) {
-    if (!secret || (clientKey && clientKey === secret)) {
-      return true;
-    }
   }
 
   return false;
@@ -2073,6 +2064,32 @@ async function requireAdminOrSecret(req: express.Request, res: express.Response,
     });
   }
   next();
+}
+
+// Middleware that enforces either admin API_SECRET_KEY or a valid server-configured RIDER_API_TOKEN
+async function requireAdminOrRiderToken(req: express.Request, res: express.Response, next: express.NextFunction) {
+  if (await isAuthorizedAdminOrSecret(req)) {
+    return next();
+  }
+
+  const riderToken = String(process.env.RIDER_API_TOKEN || "").trim();
+  if (riderToken) {
+    if (timingSafeStringEqual(req.headers["x-rider-token"], riderToken)) {
+      return next();
+    }
+    const authHeader = req.headers.authorization;
+    if (typeof authHeader === "string" && authHeader.startsWith("Bearer ")) {
+      const bearerToken = authHeader.substring(7).trim();
+      if (timingSafeStringEqual(bearerToken, riderToken)) {
+        return next();
+      }
+    }
+  }
+
+  return res.status(401).json({
+    success: false,
+    message: "Unauthorized: Admin secret or valid rider token required."
+  });
 }
 
 const orderCheckoutLimiter = rateLimit({
@@ -2215,6 +2232,14 @@ async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT) || 3000;
 
+  // Resolve Email OTP HMAC secret once at startup (no hardcoded fallback)
+  const EMAIL_OTP_HMAC_SECRET = resolveEmailOtpSecret(process.env);
+  if (!EMAIL_OTP_HMAC_SECRET) {
+    console.error(
+      "[Security Startup Error] API_SECRET_KEY or SESSION_SECRET is unset. Email OTP endpoints will fail closed with HTTP 500 until configured."
+    );
+  }
+
   // Set trust proxy to trust Cloud Run, Render, and reverse proxy headers (X-Forwarded-For)
   app.set("trust proxy", 1);
 
@@ -2276,7 +2301,7 @@ async function startServer() {
     }
 
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, x-api-key, x-admin-key, x-admin-email, x-user-email, x-idempotency-key, x-smartrun-platform, if-none-match, Cache-Control, Pragma, Cookie, x-requested-with");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, x-api-key, x-admin-key, x-rider-token, x-user-email, x-idempotency-key, x-smartrun-platform, if-none-match, Cache-Control, Pragma, Cookie, x-requested-with");
     res.setHeader("Access-Control-Expose-Headers", "ETag, X-Cache, Content-Disposition, Set-Cookie");
 
     if (req.method === "OPTIONS") {
@@ -2303,7 +2328,17 @@ async function startServer() {
   );
 
   // 1b. Standard JSON and URL-encoded body parsers for all POST/PUT/PATCH API requests
-  app.use(express.json({ limit: "15mb" }));
+  app.use(
+    express.json({
+      limit: "15mb",
+      verify: (req: any, _res, buf) => {
+        const pathOnly = String(req.originalUrl || req.url || "").split("?")[0];
+        if (pathOnly === "/api/razorpay/webhook") {
+          req.rawBody = buf;
+        }
+      }
+    })
+  );
   app.use(express.urlencoded({ extended: true, limit: "15mb" }));
 
   // =========================================================================
@@ -4141,14 +4176,16 @@ async function startServer() {
       // Background Resend Notifications (skip duplicates on same-user idempotent retry)
       if (!isExistingSameUserOrder) {
         try {
-          const adminHtml = generateAdminOrderAlertHtml(authoritativeOrder);
-          const adminSubject = `🚨 [NEW ORDER] ${shortDisplayId} (₹${serverGrandTotal.toLocaleString("en-IN")}) - ${authoritativeOrder.customerName}`;
-          dispatchResendEmail({
-            to: ADMIN_EMAILS,
-            subject: adminSubject,
-            html: adminHtml,
-            text: `New order ${shortDisplayId} placed by ${authoritativeOrder.customerName} (${authoritativeOrder.phone}). Amount: ₹${serverGrandTotal}.`
-          }).catch(() => {});
+          if (ADMIN_EMAILS.length > 0) {
+            const adminHtml = generateAdminOrderAlertHtml(authoritativeOrder);
+            const adminSubject = `🚨 [NEW ORDER] ${shortDisplayId} (₹${serverGrandTotal.toLocaleString("en-IN")}) - ${authoritativeOrder.customerName}`;
+            dispatchResendEmail({
+              to: ADMIN_EMAILS,
+              subject: adminSubject,
+              html: adminHtml,
+              text: `New order ${shortDisplayId} placed by ${authoritativeOrder.customerName} (${authoritativeOrder.phone}). Amount: ₹${serverGrandTotal}.`
+            }).catch(() => {});
+          }
 
           if (authoritativeOrder.customerEmail && authoritativeOrder.customerEmail.includes("@")) {
             const custHtml = generateOrderEmailHtml(authoritativeOrder, authoritativeOrder.customerName);
@@ -4288,28 +4325,33 @@ async function startServer() {
   });
 
   // POST /api/orders/:id/rider-location -> Rider App / Delivery Partner GPS broadcast
-  app.post("/api/orders/:id/rider-location", async (req, res) => {
+  app.post("/api/orders/:id/rider-location", requireAdminOrRiderToken, async (req, res) => {
     res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
     try {
-      const orderId = req.params.id;
-      const { lat, lng, heading, speed, riderName, partnerId } = req.body || {};
-
-      const numLat = Number(lat);
-      const numLng = Number(lng);
-
-      if (isNaN(numLat) || isNaN(numLng) || numLat < -90 || numLat > 90 || numLng < -180 || numLng > 180) {
+      const orderId = String(req.params.id || "").trim();
+      if (!orderId) {
         return res.status(400).json({
           success: false,
-          message: "Valid numeric latitude (-90 to 90) and longitude (-180 to 180) are required."
+          message: "Order ID is required."
+        });
+      }
+
+      const { lat, lng, heading, speed, riderName, partnerId } = req.body || {};
+      const coords = validateLatLng(lat, lng);
+      if (!coords.valid || !("lat" in coords)) {
+        const errMsg = "message" in coords ? coords.message : "Valid numeric latitude (-90 to 90) and longitude (-180 to 180) are required.";
+        return res.status(400).json({
+          success: false,
+          message: errMsg
         });
       }
 
       const record: LiveRiderLocationRecord = {
         orderId,
-        lat: numLat,
-        lng: numLng,
-        heading: typeof heading === "number" ? heading : undefined,
-        speed: typeof speed === "number" ? speed : undefined,
+        lat: coords.lat,
+        lng: coords.lng,
+        heading: typeof heading === "number" && Number.isFinite(heading) ? heading : undefined,
+        speed: typeof speed === "number" && Number.isFinite(speed) ? speed : undefined,
         riderName: riderName || "Delivery Partner",
         partnerId: partnerId || undefined,
         updatedAt: new Date().toISOString()
@@ -4317,19 +4359,25 @@ async function startServer() {
 
       liveRiderLocations.set(orderId, record);
 
-      // Persist to database if Supabase is connected
+      // Persist to database by merging into existing delivery_partner JSON so phone/vehicleNumber are preserved
       const sb = getServerSupabase();
       if (sb) {
         try {
+          const { data: existingOrderRow } = await sb
+            .from("orders")
+            .select("delivery_partner")
+            .eq("id", orderId)
+            .maybeSingle();
+
+          const mergedDeliveryPartner = mergeDeliveryPartnerLocation(
+            existingOrderRow?.delivery_partner,
+            record
+          );
+
           await sb
             .from("orders")
             .update({
-              delivery_partner: {
-                name: record.riderName,
-                lat: record.lat,
-                lng: record.lng,
-                current_location: record
-              }
+              delivery_partner: mergedDeliveryPartner
             })
             .eq("id", orderId);
         } catch (dbErr) {
@@ -4999,36 +5047,115 @@ async function startServer() {
         });
       }
 
-      const parsedAmount = amount ? Number(amount) : undefined;
-      const amountInPaise = parsedAmount && parsedAmount > 0 ? Math.round(parsedAmount * 100) : undefined;
+      const cleanPaymentId = typeof paymentId === "string" ? paymentId.trim() : "";
+      const cleanOrderId = typeof orderId === "string" ? orderId.trim() : "";
+
+      const amountCheck = parseOptionalRefundAmount(amount);
+      if (!("amount" in amountCheck)) {
+        return res.status(400).json({
+          success: false,
+          message: amountCheck.message
+        });
+      }
+      let effectiveAmount = amountCheck.amount;
+
+      // For non-admins, verify order ownership, payment_id match, and amount <= order.total_amount
+      if (!isAuthAdmin) {
+        if (!cleanOrderId || !cleanPaymentId) {
+          return res.status(400).json({
+            success: false,
+            message: "Valid orderId and paymentId are required to initiate a refund."
+          });
+        }
+
+        const sb = getServerSupabase();
+        if (!sb) {
+          return res.status(503).json({
+            success: false,
+            message: "Order verification database is temporarily unavailable."
+          });
+        }
+
+        const loadOrderForRefund = async (column: "id" | "order_id") => {
+          let queryRes = await sb
+            .from("orders")
+            .select("id, order_id, user_id, payment_id, razorpay_payment_id, total_amount")
+            .eq(column, cleanOrderId)
+            .maybeSingle();
+
+          if (queryRes.error && queryRes.error.code === "42703") {
+            queryRes = await sb
+              .from("orders")
+              .select("id, user_id, payment_id, total_amount")
+              .eq(column, cleanOrderId)
+              .maybeSingle();
+          }
+          return queryRes;
+        };
+
+        let { data: orderRow, error: orderLoadError } = await loadOrderForRefund("id");
+        if (!orderRow && !orderLoadError) {
+          const fallbackRes = await loadOrderForRefund("order_id");
+          orderRow = fallbackRes.data;
+          orderLoadError = fallbackRes.error;
+        }
+
+        if (orderLoadError) {
+          console.error("[Razorpay Refund] Failed to load order from Supabase:", orderLoadError);
+          return res.status(500).json({
+            success: false,
+            message: "Unable to verify order details for refund."
+          });
+        }
+
+        const refundValidation = validateNonAdminRefundRequest({
+          order: orderRow,
+          authUser,
+          paymentId: cleanPaymentId,
+          requestedAmount: effectiveAmount
+        });
+
+        if (!("effectiveAmount" in refundValidation)) {
+          return res.status(refundValidation.status).json({
+            success: false,
+            message: refundValidation.message
+          });
+        }
+
+        effectiveAmount = refundValidation.effectiveAmount;
+      }
+
+      const amountInPaise =
+        effectiveAmount !== undefined && effectiveAmount > 0
+          ? Math.round(effectiveAmount * 100)
+          : undefined;
 
       const activeKeyId = resolveRazorpayKeyId();
-      const isLiveMode = activeKeyId.startsWith("rzp_live_") || process.env.NODE_ENV === "production";
+      const isTestPayment = isTestRefundPayment(cleanPaymentId, cleanOrderId);
+      const canSimulate = isSimulatedRefundAllowed({
+        nodeEnv: process.env.NODE_ENV,
+        isTestPayment,
+        razorpayKeyId: activeKeyId
+      });
 
-      const isTestPayment =
-        !paymentId ||
-        String(paymentId).startsWith("pay_test_") ||
-        String(paymentId).startsWith("test_") ||
-        String(orderId || "").startsWith("order_test_");
-
-      if (isTestPayment && isLiveMode) {
+      if (isTestPayment && !canSimulate) {
         return res.status(403).json({
           success: false,
-          message: "Simulated test refunds are disabled in live production mode."
+          message: "Simulated test refunds are disabled in production mode."
         });
       }
 
-      // When test payment or simulation in development
-      if (isTestPayment) {
+      // Dev-only sandbox test refund (strictly disallowed when NODE_ENV === "production")
+      if (canSimulate) {
         const mockRefundId = `rfnd_test_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
         return res.status(200).json({
           success: true,
           refundId: mockRefundId,
           status: "processed",
-          amount: parsedAmount || 0,
+          amount: effectiveAmount || 0,
           currency: "INR",
           speedProcessed: "optimum",
-          paymentId: paymentId || `pay_test_${Date.now()}`,
+          paymentId: cleanPaymentId || `pay_test_${Date.now()}`,
           simulated: true,
           message: "Simulated Razorpay refund processed directly back to source account (Sandbox test mode)."
         });
@@ -5037,26 +5164,19 @@ async function startServer() {
       const razorpay = getRazorpayClient();
 
       if (!razorpay) {
-        // If live credentials are not set on server, return simulated refund so cancellation succeeds
-        const mockRefundId = `rfnd_test_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-        return res.status(200).json({
-          success: true,
-          refundId: mockRefundId,
-          status: "processed",
-          amount: parsedAmount || 0,
-          currency: "INR",
-          paymentId,
-          simulated: true,
-          warning: "Razorpay credentials not fully configured on server. Test refund recorded."
+        return res.status(503).json({
+          success: false,
+          error: "Razorpay refund service is not configured on the server.",
+          message: "Razorpay refund service is not configured on the server."
         });
       }
 
-      let targetPaymentId = paymentId;
+      let targetPaymentId = cleanPaymentId;
 
-      // If paymentId was not provided, but orderId was provided (e.g. order_xxx), attempt to fetch payments for the order
-      if (!targetPaymentId && orderId && String(orderId).startsWith("order_")) {
+      // Admin-only fallback: if paymentId was omitted, attempt to fetch payments for a Razorpay order_xxx
+      if (!targetPaymentId && isAuthAdmin && cleanOrderId && cleanOrderId.startsWith("order_")) {
         try {
-          const orderPayments = await razorpay.orders.fetchPayments(orderId);
+          const orderPayments = await razorpay.orders.fetchPayments(cleanOrderId);
           if (orderPayments && Array.isArray(orderPayments.items) && orderPayments.items.length > 0) {
             const captured = orderPayments.items.find((p: any) => p.status === "captured") || orderPayments.items[0];
             targetPaymentId = captured.id;
@@ -5078,8 +5198,10 @@ async function startServer() {
         const refundPayload: any = {
           speed: "optimum",
           notes: {
-            orderId: orderId || "N/A",
-            reason: reason || "Order cancelled by customer within allowed cancellation window",
+            orderId: cleanOrderId || "N/A",
+            reason: typeof reason === "string" && reason.trim()
+              ? reason.trim().slice(0, 250)
+              : "Order cancelled by customer within allowed cancellation window",
             brand: "SmartRun Kolkata"
           }
         };
@@ -5093,7 +5215,7 @@ async function startServer() {
           success: true,
           refundId: refundResult.id,
           status: refundResult.status || "processed",
-          amount: refundResult.amount ? refundResult.amount / 100 : parsedAmount,
+          amount: refundResult.amount ? refundResult.amount / 100 : effectiveAmount,
           currency: refundResult.currency || "INR",
           speedProcessed: refundResult.speed_processed || "optimum",
           paymentId: targetPaymentId,
@@ -5114,17 +5236,10 @@ async function startServer() {
       }
     } catch (err: any) {
       console.error("Razorpay refund processing error:", err);
-      const mockRefundId = `rfnd_test_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-      return res.status(200).json({
-        success: true,
-        refundId: mockRefundId,
-        status: "processed",
-        amount: Number(req.body?.amount || 0),
-        currency: "INR",
-        speedProcessed: "optimum",
-        paymentId: req.body?.paymentId,
-        simulated: true,
-        message: "Simulated refund processed."
+      return res.status(500).json({
+        success: false,
+        error: err?.message || "Failed to process Razorpay refund.",
+        message: err?.message || "Failed to process Razorpay refund."
       });
     }
   });
@@ -5136,20 +5251,35 @@ async function startServer() {
    */
   app.post("/api/razorpay/webhook", async (req, res) => {
     try {
-      const webhookSignature = req.headers["x-razorpay-signature"] as string;
-      const webhookSecret = (process.env.RAZORPAY_WEBHOOK_SECRET || process.env.RAZORPAY_KEY_SECRET || "").trim();
+      const webhookSecret = String(process.env.RAZORPAY_WEBHOOK_SECRET || "")
+        .trim()
+        .replace(/^['"]|['"]$/g, "");
+      if (!webhookSecret) {
+        console.error("[Razorpay Webhook] RAZORPAY_WEBHOOK_SECRET is not configured.");
+        return res.status(500).json({ error: "Webhook secret is not configured." });
+      }
 
-      // If webhook secret is configured, verify HMAC SHA256 signature
-      if (webhookSecret && webhookSignature) {
-        const expectedSignature = crypto
-          .createHmac("sha256", webhookSecret)
-          .update(JSON.stringify(req.body))
-          .digest("hex");
+      const webhookSignature = req.headers["x-razorpay-signature"];
+      if (typeof webhookSignature !== "string" || !webhookSignature.trim()) {
+        console.warn("[Razorpay Webhook] Missing x-razorpay-signature header.");
+        return res.status(400).json({ error: "Missing x-razorpay-signature header." });
+      }
 
-        if (expectedSignature !== webhookSignature) {
-          console.warn("[Razorpay Webhook] Invalid webhook signature received.");
-          return res.status(400).json({ error: "Invalid webhook signature." });
-        }
+      const rawBody: Buffer | undefined = (req as any).rawBody;
+      if (!Buffer.isBuffer(rawBody) || rawBody.length === 0) {
+        console.warn("[Razorpay Webhook] Missing raw request body for signature verification.");
+        return res.status(400).json({ error: "Missing raw request body." });
+      }
+
+      const isSignatureValid = verifyRazorpayWebhookSignature({
+        rawBody,
+        signature: webhookSignature,
+        webhookSecret
+      });
+
+      if (!isSignatureValid) {
+        console.warn("[Razorpay Webhook] Invalid webhook signature received.");
+        return res.status(400).json({ error: "Invalid webhook signature." });
       }
 
       const event = req.body?.event;
@@ -5174,7 +5304,7 @@ async function startServer() {
               .from("orders")
               .update({
                 payment_status: "paid",
-                status: "confirmed",
+                status: "accepted",
                 razorpay_payment_id: paymentId,
                 payment_id: paymentId,
                 updated_at: new Date().toISOString()
@@ -5184,7 +5314,7 @@ async function startServer() {
             if (updateErr) {
               console.warn("[Razorpay Webhook] Notice updating order in Supabase:", updateErr.message);
             } else {
-              console.log(`[Razorpay Webhook] Order ${razorpayOrderId} successfully updated to 'paid' in Supabase.`);
+              console.log(`[Razorpay Webhook] Order ${razorpayOrderId} successfully updated to 'paid' ('accepted') in Supabase.`);
             }
           } catch (dbErr) {
             console.warn("[Razorpay Webhook] DB error:", dbErr);
@@ -5203,36 +5333,61 @@ async function startServer() {
   });
 
   // POST /api/rider/location -> Generic endpoint for rider GPS telemetry
-  app.post("/api/rider/location", async (req, res) => {
+  app.post("/api/rider/location", requireAdminOrRiderToken, async (req, res) => {
     res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
     try {
       const { orderId, lat, lng, heading, speed, riderName, partnerId } = req.body || {};
-      if (!orderId) {
+      const cleanOrderId = String(orderId || "").trim();
+      if (!cleanOrderId) {
         return res.status(400).json({ success: false, message: "orderId is required." });
       }
 
-      const numLat = Number(lat);
-      const numLng = Number(lng);
-      if (isNaN(numLat) || isNaN(numLng)) {
-        return res.status(400).json({ success: false, message: "Valid lat and lng required." });
+      const coords = validateLatLng(lat, lng);
+      if (!coords.valid || !("lat" in coords)) {
+        const errMsg = "message" in coords ? coords.message : "Valid numeric latitude (-90 to 90) and longitude (-180 to 180) are required.";
+        return res.status(400).json({ success: false, message: errMsg });
       }
 
       const record: LiveRiderLocationRecord = {
-        orderId,
-        lat: numLat,
-        lng: numLng,
-        heading: typeof heading === "number" ? heading : undefined,
-        speed: typeof speed === "number" ? speed : undefined,
+        orderId: cleanOrderId,
+        lat: coords.lat,
+        lng: coords.lng,
+        heading: typeof heading === "number" && Number.isFinite(heading) ? heading : undefined,
+        speed: typeof speed === "number" && Number.isFinite(speed) ? speed : undefined,
         riderName: riderName || "Delivery Partner",
         partnerId: partnerId || undefined,
         updatedAt: new Date().toISOString()
       };
 
-      liveRiderLocations.set(orderId, record);
+      liveRiderLocations.set(cleanOrderId, record);
+
+      // Persist to database by merging into existing delivery_partner JSON so phone/vehicleNumber are preserved
+      const sb = getServerSupabase();
+      if (sb) {
+        try {
+          const { data: existingOrderRow } = await sb
+            .from("orders")
+            .select("delivery_partner")
+            .eq("id", cleanOrderId)
+            .maybeSingle();
+
+          const mergedDeliveryPartner = mergeDeliveryPartnerLocation(
+            existingOrderRow?.delivery_partner,
+            record
+          );
+
+          await sb
+            .from("orders")
+            .update({ delivery_partner: mergedDeliveryPartner })
+            .eq("id", cleanOrderId);
+        } catch (dbErr) {
+          console.warn("[Server POST /api/rider/location DB notice]:", dbErr);
+        }
+      }
 
       return res.status(200).json({
         success: true,
-        orderId,
+        orderId: cleanOrderId,
         location: record
       });
     } catch (err: any) {
@@ -5244,40 +5399,73 @@ async function startServer() {
   app.delete("/api/orders/:id", async (req, res) => {
     res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
     try {
-      const orderId = req.params.id;
+      const orderId = String(req.params.id || "").trim();
       if (!orderId) {
         return res.status(400).json({ success: false, message: "Order ID is required." });
       }
 
       const authUser = await getAuthenticatedUser(req);
       const isAuthAdmin = await isAuthorizedAdminOrSecret(req);
-
+      const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(orderId);
       const sb = getServerSupabase();
+
+      let verifiedOrderDbId = orderId;
+
       if (!isAuthAdmin) {
-        if (!authUser) {
+        const allowedUserIds = getAllowedUserIds(authUser);
+        if (!authUser || allowedUserIds.length === 0) {
           return res.status(401).json({ success: false, message: "Authentication required to delete order." });
         }
-        if (sb) {
-          const { data: existingOrder } = await sb.from("orders").select("user_id, status").eq("id", orderId).maybeSingle();
-          if (existingOrder && existingOrder.user_id && existingOrder.user_id !== authUser.id) {
-            return res.status(403).json({ success: false, message: "Forbidden: You can only delete your own orders." });
-          }
+        if (!sb) {
+          return res.status(503).json({ success: false, message: "Order database unavailable." });
         }
-      }
 
-      if (sb) {
-        const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(orderId);
+        const { data: existingOrder, error: lookupError } = isUUID
+          ? await sb.from("orders").select("id, user_id, status").eq("id", orderId).maybeSingle()
+          : await sb.from("orders").select("id, user_id, status").eq("tracking_number", orderId).maybeSingle();
+
+        if (lookupError || !existingOrder) {
+          return res.status(404).json({ success: false, message: "Order not found." });
+        }
+
+        const orderOwnerId = existingOrder.user_id ? String(existingOrder.user_id).trim() : "";
+        if (!orderOwnerId || !allowedUserIds.includes(orderOwnerId)) {
+          return res.status(403).json({ success: false, message: "Forbidden: You can only delete your own orders." });
+        }
+
+        verifiedOrderDbId = String(existingOrder.id);
+
+        try {
+          await sb.from("order_items").delete().eq("order_id", verifiedOrderDbId);
+          const deleteQuery = sb.from("orders").delete().eq("id", verifiedOrderDbId);
+          const { error } = allowedUserIds.length === 1
+            ? await deleteQuery.eq("user_id", allowedUserIds[0])
+            : await deleteQuery.in("user_id", allowedUserIds);
+          if (error && !error.message?.includes("Invalid API key")) {
+            console.warn("[Server Delete order DB error]:", error.message);
+          }
+        } catch (dbErr: any) {
+          console.warn("[Server Delete order notice]:", dbErr?.message || dbErr);
+        }
+      } else if (sb) {
         try {
           if (isUUID) {
-            // Delete child order items first
             await sb.from("order_items").delete().eq("order_id", orderId);
             const { error } = await sb.from("orders").delete().eq("id", orderId);
             if (error && !error.message?.includes("Invalid API key")) {
               console.warn("[Server Delete order DB error]:", error.message);
             }
           } else {
-            // Try matching tracking_number if not a direct UUID
-            await sb.from("orders").delete().eq("tracking_number", orderId);
+            const { data: matched } = await sb
+              .from("orders")
+              .select("id")
+              .eq("tracking_number", orderId)
+              .maybeSingle();
+            if (matched?.id) {
+              verifiedOrderDbId = String(matched.id);
+              await sb.from("order_items").delete().eq("order_id", verifiedOrderDbId);
+              await sb.from("orders").delete().eq("id", verifiedOrderDbId);
+            }
           }
         } catch (dbErr: any) {
           console.warn("[Server Delete order notice]:", dbErr?.message || dbErr);
@@ -5286,7 +5474,7 @@ async function startServer() {
 
       // Evict from server idempotency cache if present
       for (const [k, v] of idempotencyStore.entries()) {
-        if (v?.orderId === orderId) {
+        if (v?.orderId === orderId || v?.orderId === verifiedOrderDbId) {
           idempotencyStore.delete(k);
         }
       }
@@ -5305,6 +5493,73 @@ async function startServer() {
     }
   });
 
+  // Helper to delete orders by explicit IDs (parameterized .in() calls only)
+  async function deleteOrdersByIds(sb: any, ids: string[]): Promise<void> {
+    const cleanIds = Array.from(new Set(ids.map((id) => String(id || "").trim()).filter(Boolean)));
+    if (!sb || cleanIds.length === 0) return;
+    await sb.from("order_items").delete().in("order_id", cleanIds);
+    await sb.from("orders").delete().in("id", cleanIds);
+  }
+
+  // Helper to delete orders belonging to one or more verified user_ids (parameterized .eq() / .in() only)
+  async function deleteOrdersForUserIds(sb: any, userIds: string[]): Promise<void> {
+    const cleanUserIds = Array.from(new Set(userIds.map((id) => String(id || "").trim()).filter(Boolean)));
+    if (!sb || cleanUserIds.length === 0) return;
+    const { data: userOrders } = cleanUserIds.length === 1
+      ? await sb.from("orders").select("id").eq("user_id", cleanUserIds[0])
+      : await sb.from("orders").select("id").in("user_id", cleanUserIds);
+    if (Array.isArray(userOrders) && userOrders.length > 0) {
+      await deleteOrdersByIds(sb, userOrders.map((o: any) => String(o.id)));
+    }
+  }
+
+  // Helper for admin-only parameterized clearing by email / phone (never interpolates into .or())
+  async function deleteOrdersByAdminFilters(
+    sb: any,
+    filters: { userId?: string; email?: string; phone?: string; orderIds?: unknown }
+  ): Promise<void> {
+    if (!sb) return;
+    if (Array.isArray(filters.orderIds) && filters.orderIds.length > 0) {
+      const cleanOrderIds = filters.orderIds
+        .filter((id) => typeof id === "string" || typeof id === "number")
+        .map((id) => String(id).trim())
+        .filter(Boolean);
+      await deleteOrdersByIds(sb, cleanOrderIds);
+    }
+    if (typeof filters.userId === "string" && filters.userId.trim()) {
+      await deleteOrdersForUserIds(sb, [filters.userId.trim()]);
+    }
+    if (typeof filters.email === "string" && filters.email.includes("@")) {
+      const cleanEmail = filters.email.trim().toLowerCase();
+      const matchedIds: string[] = [];
+      const { data: byCustEmail } = await sb.from("orders").select("id").eq("customer_email", cleanEmail);
+      if (Array.isArray(byCustEmail)) {
+        matchedIds.push(...byCustEmail.map((o: any) => String(o.id)));
+      }
+      const { data: byRecipEmail } = await sb.from("orders").select("id").eq("recipient_email", cleanEmail);
+      if (Array.isArray(byRecipEmail)) {
+        matchedIds.push(...byRecipEmail.map((o: any) => String(o.id)));
+      }
+      await deleteOrdersByIds(sb, matchedIds);
+    }
+    if (typeof filters.phone === "string" && filters.phone.trim()) {
+      const cleanPhone = filters.phone.replace(/\D/g, "").slice(-10);
+      if (/^\d{10}$/.test(cleanPhone)) {
+        const phoneVariants = [cleanPhone, `+91${cleanPhone}`];
+        const matchedIds: string[] = [];
+        const { data: byPhone } = await sb.from("orders").select("id").in("phone", phoneVariants);
+        if (Array.isArray(byPhone)) {
+          matchedIds.push(...byPhone.map((o: any) => String(o.id)));
+        }
+        const { data: byRecipPhone } = await sb.from("orders").select("id").in("recipient_phone", phoneVariants);
+        if (Array.isArray(byRecipPhone)) {
+          matchedIds.push(...byRecipPhone.map((o: any) => String(o.id)));
+        }
+        await deleteOrdersByIds(sb, matchedIds);
+      }
+    }
+  }
+
   // Clear all user orders from Supabase database
   app.delete("/api/orders", async (req, res) => {
     res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
@@ -5313,54 +5568,28 @@ async function startServer() {
 
       const authUser = await getAuthenticatedUser(req);
       const isAuthAdmin = await isAuthorizedAdminOrSecret(req);
-
-      if (!isAuthAdmin) {
-        if (!authUser || (userId && authUser.id !== userId)) {
-          return res.status(401).json({ success: false, message: "Unauthorized: You can only clear your own order history." });
-        }
-      }
-
       const sb = getServerSupabase();
 
-      if (sb && (userId || email || phone)) {
+      if (!isAuthAdmin) {
+        const allowedUserIds = getAllowedUserIds(authUser);
+        if (!authUser || allowedUserIds.length === 0) {
+          return res.status(401).json({ success: false, message: "Unauthorized: You can only clear your own order history." });
+        }
+        if (userId && !allowedUserIds.includes(String(userId).trim())) {
+          return res.status(403).json({ success: false, message: "Forbidden: You can only clear your own order history." });
+        }
+
+        // For non-admins, completely ignore email and phone from the request; delete strictly by authenticated user's id
+        if (sb) {
+          try {
+            await deleteOrdersForUserIds(sb, allowedUserIds);
+          } catch (dbErr) {
+            console.warn("[Server Clear Orders DB Notice]:", dbErr);
+          }
+        }
+      } else if (sb && (userId || email || phone)) {
         try {
-          if (userId) {
-            const { data: userOrders } = await sb.from("orders").select("id").eq("user_id", userId);
-            if (userOrders && userOrders.length > 0) {
-              const ids = userOrders.map((o: any) => o.id);
-              await sb.from("order_items").delete().in("order_id", ids);
-            }
-            await sb.from("orders").delete().eq("user_id", userId);
-          }
-          if (email && email.includes("@")) {
-            const cleanEmail = email.trim().toLowerCase();
-            const { data: emailOrders } = await sb
-              .from("orders")
-              .select("id")
-              .or(`customer_email.ilike.${cleanEmail},recipient_email.ilike.${cleanEmail}`);
-            if (emailOrders && emailOrders.length > 0) {
-              const ids = emailOrders.map((o: any) => o.id);
-              await sb.from("order_items").delete().in("order_id", ids);
-            }
-            await sb.from("orders").delete().or(`customer_email.ilike.${cleanEmail},recipient_email.ilike.${cleanEmail}`);
-          }
-          if (phone) {
-            const cleanPhone = phone.replace(/\D/g, "").slice(-10);
-            if (cleanPhone) {
-              const { data: phoneOrders } = await sb
-                .from("orders")
-                .select("id")
-                .or(`phone.eq.${cleanPhone},phone.eq.+91${cleanPhone},recipient_phone.eq.${cleanPhone},recipient_phone.eq.+91${cleanPhone}`);
-              if (phoneOrders && phoneOrders.length > 0) {
-                const ids = phoneOrders.map((o: any) => o.id);
-                await sb.from("order_items").delete().in("order_id", ids);
-              }
-              await sb
-                .from("orders")
-                .delete()
-                .or(`phone.eq.${cleanPhone},phone.eq.+91${cleanPhone},recipient_phone.eq.${cleanPhone},recipient_phone.eq.+91${cleanPhone}`);
-            }
-          }
+          await deleteOrdersByAdminFilters(sb, { userId, email, phone });
         } catch (dbErr) {
           console.warn("[Server Clear Orders DB Notice]:", dbErr);
         }
@@ -5387,42 +5616,28 @@ async function startServer() {
 
       const authUser = await getAuthenticatedUser(req);
       const isAuthAdmin = await isAuthorizedAdminOrSecret(req);
-
-      if (!isAuthAdmin) {
-        if (!authUser || (userId && authUser.id !== userId)) {
-          return res.status(401).json({ success: false, message: "Unauthorized: You can only clear your own order history." });
-        }
-      }
-
       const sb = getServerSupabase();
 
-      if (sb) {
+      if (!isAuthAdmin) {
+        const allowedUserIds = getAllowedUserIds(authUser);
+        if (!authUser || allowedUserIds.length === 0) {
+          return res.status(401).json({ success: false, message: "Unauthorized: You can only clear your own order history." });
+        }
+        if (userId && !allowedUserIds.includes(String(userId).trim())) {
+          return res.status(403).json({ success: false, message: "Forbidden: You can only clear your own order history." });
+        }
+
+        // For non-admins, completely ignore email, phone, and orderIds from the request; delete strictly by authenticated user's id
+        if (sb) {
+          try {
+            await deleteOrdersForUserIds(sb, allowedUserIds);
+          } catch (dbErr) {
+            console.warn("[Server POST /api/orders/clear DB Notice]:", dbErr);
+          }
+        }
+      } else if (sb) {
         try {
-          if (Array.isArray(orderIds) && orderIds.length > 0) {
-            await sb.from("order_items").delete().in("order_id", orderIds);
-            await sb.from("orders").delete().in("id", orderIds);
-          }
-          if (userId) {
-            const { data: userOrders } = await sb.from("orders").select("id").eq("user_id", userId);
-            if (userOrders && userOrders.length > 0) {
-              const ids = userOrders.map((o: any) => o.id);
-              await sb.from("order_items").delete().in("order_id", ids);
-            }
-            await sb.from("orders").delete().eq("user_id", userId);
-          }
-          if (email && email.includes("@")) {
-            const cleanEmail = email.trim().toLowerCase();
-            await sb.from("orders").delete().or(`customer_email.ilike.${cleanEmail},recipient_email.ilike.${cleanEmail}`);
-          }
-          if (phone) {
-            const cleanPhone = phone.replace(/\D/g, "").slice(-10);
-            if (cleanPhone) {
-              await sb
-                .from("orders")
-                .delete()
-                .or(`phone.eq.${cleanPhone},phone.eq.+91${cleanPhone},recipient_phone.eq.${cleanPhone},recipient_phone.eq.+91${cleanPhone}`);
-            }
-          }
+          await deleteOrdersByAdminFilters(sb, { userId, email, phone, orderIds });
         } catch (dbErr) {
           console.warn("[Server POST /api/orders/clear DB Notice]:", dbErr);
         }
@@ -5880,7 +6095,6 @@ async function startServer() {
         return res.status(400).json({ success: false, message: "Missing identifier" });
       }
 
-      const ADMIN_EMAILS = ["gauravgiri123344@gmail.com", "mdhassan1738@gmail.com"];
       const cleanEmail = email ? String(email).trim().toLowerCase() : "";
       const isReqAdmin = Boolean(cleanEmail && ADMIN_EMAILS.includes(cleanEmail));
 
@@ -5981,7 +6195,6 @@ async function startServer() {
         userScope?: string;
       };
 
-      const ADMIN_EMAILS = ["gauravgiri123344@gmail.com", "mdhassan1738@gmail.com"];
       const adminNames = ["md hassan", "md. hassan", "hassan", "mdhassan"];
 
       const cleanPhone = phone ? phone.replace(/\D/g, "").slice(-10) : "";
@@ -6475,8 +6688,6 @@ Tone: direct, confident, objective. Output ONLY the single sentence. No quotatio
       officialEmail: OFFICIAL_EMAIL,
       resendInboundEmail: RESEND_INBOUND_EMAIL,
       resendInboundDomain: RESEND_INBOUND_DOMAIN,
-      adminEmails: ADMIN_EMAILS,
-      adminEmail: ADMIN_EMAIL,
       inboundWebhookUrl: "/api/resend/inbound",
       receivedCount: receivedEmailsStore.length,
       unreadCount,
@@ -6582,8 +6793,8 @@ Tone: direct, confident, objective. Output ONLY the single sentence. No quotatio
         attachments
       });
 
-      // If this was an order confirmation, also ensure Admin Alert is triggered in background
-      if (type === "order_confirmation" && order) {
+      // If this was an order confirmation, also ensure Admin Alert is triggered in background when configured
+      if (type === "order_confirmation" && order && ADMIN_EMAILS.length > 0) {
         try {
           const adminHtml = generateAdminOrderAlertHtml(order);
           const adminSubject = `🚨 NEW ORDER #${order.id} (₹${(order.totalAmount || 0).toLocaleString('en-IN')}) - ${order.customerName || 'Customer'}`;
@@ -6795,12 +7006,15 @@ Tone: direct, confident, objective. Output ONLY the single sentence. No quotatio
         </div>
       `;
 
-      const dispatchResult = await dispatchResendEmail({
-        to: ADMIN_EMAILS,
-        subject,
-        html,
-        text: `🆘 Customer Help Alert: ${clientName} (${clientPhone}) needs assistance on Order #${displayOrderNum}. Current stage: ${statusLabel || status}. Rider: ${riderName || 'None'}. Amount: ₹${totalAmount || 0}.`
-      });
+      const dispatchResult =
+        ADMIN_EMAILS.length > 0
+          ? await dispatchResendEmail({
+              to: ADMIN_EMAILS,
+              subject,
+              html,
+              text: `🆘 Customer Help Alert: ${clientName} (${clientPhone}) needs assistance on Order #${displayOrderNum}. Current stage: ${statusLabel || status}. Rider: ${riderName || 'None'}. Amount: ₹${totalAmount || 0}.`
+            })
+          : { success: false, skipped: true };
 
       return res.status(200).json({ success: true, dispatchResult });
     } catch (err: any) {
@@ -7117,20 +7331,22 @@ Tone: direct, confident, objective. Output ONLY the single sentence. No quotatio
       let adminAlertSent = false;
       let customerInvoiceSent = false;
 
-      // 1. Send Admin Alert Email to all verified admin users
-      try {
-        const adminHtml = generateAdminOrderAlertHtml(order);
-        const adminSubject = `🚨 [NEW ORDER RECEIVED] #${order.id} (₹${(order.totalAmount || 0).toLocaleString('en-IN')}) - ${order.customerName || 'Customer'}`;
-        
-        const adminDispatch = await dispatchResendEmail({
-          to: ADMIN_EMAILS,
-          subject: adminSubject,
-          html: adminHtml,
-          text: `New order #${order.id} placed by ${order.customerName} (${order.phone}). Amount: ₹${order.totalAmount}. Address: ${order.address}, ${order.area}, PIN: ${order.pincode}.`
-        });
-        adminAlertSent = adminDispatch.success;
-      } catch (adminErr: any) {
-        console.warn("[Admin Order Alert Email Notice]:", adminErr);
+      // 1. Send Admin Alert Email if ADMIN_EMAILS is configured
+      if (ADMIN_EMAILS.length > 0) {
+        try {
+          const adminHtml = generateAdminOrderAlertHtml(order);
+          const adminSubject = `🚨 [NEW ORDER RECEIVED] #${order.id} (₹${(order.totalAmount || 0).toLocaleString('en-IN')}) - ${order.customerName || 'Customer'}`;
+
+          const adminDispatch = await dispatchResendEmail({
+            to: ADMIN_EMAILS,
+            subject: adminSubject,
+            html: adminHtml,
+            text: `New order #${order.id} placed by ${order.customerName} (${order.phone}). Amount: ₹${order.totalAmount}. Address: ${order.address}, ${order.area}, PIN: ${order.pincode}.`
+          });
+          adminAlertSent = adminDispatch.success;
+        } catch (adminErr: any) {
+          console.warn("[Admin Order Alert Email Notice]:", adminErr);
+        }
       }
 
       // 2. Send Customer Tax Invoice if email provided
@@ -8369,8 +8585,7 @@ Knowledge Base & Service Details:
 
       const effectiveUid = cleanUid || (cleanPhone ? `phone_${cleanPhone}` : `uid_${cleanEmail.replace(/[^a-zA-Z0-9]/g, '_')}`);
       const formattedPhone = cleanPhone ? `+91${cleanPhone}` : (phone || null);
-      const isUserAdmin = Boolean((cleanEmail && ADMIN_EMAILS.includes(cleanEmail)) || cleanPhone === "8777400280");
-      const effectiveRole = isUserAdmin ? "admin" : (role === "admin" ? "admin" : "customer");
+      const effectiveRole: "customer" = "customer";
 
       // Save/refresh in serverProfileStore
       const profileRecord: ServerUserProfileRecord = {
@@ -8441,13 +8656,6 @@ Knowledge Base & Service Details:
         userProfile = serverProfileStore.get(email.toLowerCase());
       }
 
-      const cleanPhoneDigits = (phone || userProfile?.phone || "").replace(/\D/g, "").slice(-10);
-      const isUserAdmin = Boolean(
-        (email && ADMIN_EMAILS.includes(email.toLowerCase())) ||
-        cleanPhoneDigits === "8777400280" ||
-        role === "admin"
-      );
-
       return res.json({
         success: true,
         authenticated: true,
@@ -8457,7 +8665,7 @@ Knowledge Base & Service Details:
           phone: userProfile?.phone || phone || undefined,
           email: userProfile?.email || email || undefined,
           name: userProfile?.full_name || name || "Customer",
-          role: isUserAdmin ? "admin" : "customer",
+          role: "customer",
           photoURL: userProfile?.avatar_url || undefined,
           dob: userProfile?.dob || undefined
         }
@@ -8825,8 +9033,7 @@ Knowledge Base & Service Details:
       const userId = existing?.user_id || `phone_${cleanPhone}`;
       const userFullName = existing?.name || existing?.full_name || fullName || "Customer";
       const userEmail = (existing?.email && !existing.email.includes("@girirajpower.internal")) ? existing.email : null;
-      const isUserAdmin = Boolean((userEmail && ADMIN_EMAILS.includes(userEmail.toLowerCase())) || cleanPhone === "8777400280");
-      const userRole = isUserAdmin ? "admin" : "customer";
+      const userRole: "customer" = "customer";
 
       // Automatically sync user to Firebase Firestore on backend server
       if (serverFirestore) {
@@ -8899,8 +9106,9 @@ Knowledge Base & Service Details:
   // =========================================================================
   // EMAIL OTP STORE & ENDPOINTS FOR MOBILE NUMBER CHANGE VERIFICATION
   // =========================================================================
+  const MAX_EMAIL_OTP_ATTEMPTS = 5;
   interface CachedEmailOtp {
-    otp: string;
+    otpHash: string;
     expiresAt: number;
     attempts: number;
     phone?: string;
@@ -8925,7 +9133,14 @@ Knowledge Base & Service Details:
   app.post("/api/auth/send-email-otp", emailOtpLimiter, async (req, res) => {
     res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
     try {
-      const { email, phone, customerName, purpose } = req.body || {};
+      if (!EMAIL_OTP_HMAC_SECRET) {
+        return res.status(500).json({
+          success: false,
+          error: "Email OTP service is not configured (API_SECRET_KEY/SESSION_SECRET missing)."
+        });
+      }
+
+      const { email, phone } = req.body || {};
       const cleanEmail = String(email || "").trim().toLowerCase();
       if (!cleanEmail || !cleanEmail.includes("@") || !cleanEmail.includes(".")) {
         return res.status(400).json({
@@ -8935,30 +9150,46 @@ Knowledge Base & Service Details:
       }
 
       const cleanPhone = phone ? String(phone).replace(/\D/g, "").slice(-10) : "";
-      const generatedOtp = Math.floor(100000 + Math.random() * 900000).toString();
-      const expiresAt = Date.now() + 10 * 60 * 1000; // 10 minutes
+      const generatedOtp = crypto.randomInt(100000, 1000000).toString();
+      const expiresAt = Date.now() + 10 * 60 * 1000; // 10 minutes TTL
+      const otpHash = computeEmailOtpHash(cleanEmail, generatedOtp, EMAIL_OTP_HMAC_SECRET);
 
+      // Persist hashed OTP server-side in memory cache AND Supabase `email_otps` table (never plaintext)
       emailOtpStore.set(cleanEmail, {
-        otp: generatedOtp,
+        otpHash,
         expiresAt,
         attempts: 0,
         phone: cleanPhone
       });
 
-      // Stateless HMAC signature token so verification never fails even if containers restart or on serverless
-      const secret = process.env.API_SECRET_KEY || 'smartrun_email_otp_secret_key_kasba';
-      const signatureToken = crypto.createHmac('sha256', secret)
-        .update(`${cleanEmail}:${generatedOtp}:${expiresAt}`)
-        .digest('hex');
-
-      console.log(`[Email OTP] Generated code for ${cleanEmail}: ${generatedOtp} (Purpose: ${purpose || 'email_update'})`);
+      const sb = getServerSupabase();
+      if (sb) {
+        try {
+          const { error: dbOtpErr } = await sb.from("email_otps").upsert(
+            {
+              email: cleanEmail,
+              otp_hash: otpHash,
+              attempts: 0,
+              phone: cleanPhone || null,
+              expires_at: new Date(expiresAt).toISOString(),
+              updated_at: new Date().toISOString()
+            },
+            { onConflict: "email" }
+          );
+          if (dbOtpErr && !dbOtpErr.message?.includes("does not exist")) {
+            console.warn("[Email OTP Store Notice]:", dbOtpErr.message);
+          }
+        } catch (dbErr) {
+          console.warn("[Email OTP Store Fallback Notice]:", dbErr);
+        }
+      }
 
       // Mask email for privacy
       const atIdx = cleanEmail.indexOf("@");
       const namePart = cleanEmail.substring(0, atIdx);
       const domainPart = cleanEmail.substring(atIdx);
-      const maskedName = namePart.length <= 2 
-        ? namePart[0] + "*" 
+      const maskedName = namePart.length <= 2
+        ? namePart[0] + "*"
         : namePart[0] + "*".repeat(Math.min(namePart.length - 2, 4)) + namePart[namePart.length - 1];
       const maskedEmail = `${maskedName}${domainPart}`;
 
@@ -9025,7 +9256,6 @@ Knowledge Base & Service Details:
         message: `Verification code sent to ${cleanEmail}`,
         email: cleanEmail,
         emailMasked: maskedEmail,
-        token: signatureToken,
         expiresAt
       });
     } catch (err: any) {
@@ -9037,76 +9267,138 @@ Knowledge Base & Service Details:
   });
 
   /**
-   * Verify Email OTP Endpoint
+   * Verify Email OTP Endpoint (Server-side HMAC hash verification with strict max 5 attempts)
    * POST /api/auth/verify-email-otp
-   * Request Body: { email: "user@example.com", otp: "123456", token?: "...", expiresAt?: 1234567890 }
+   * Request Body: { email: "user@example.com", otp: "123456" }
    */
-  app.post("/api/auth/verify-email-otp", (req, res) => {
+  app.post("/api/auth/verify-email-otp", otpVerifyLimiter, async (req, res) => {
     res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
     try {
-      const { email, otp, token, expiresAt } = req.body || {};
+      if (!EMAIL_OTP_HMAC_SECRET) {
+        return res.status(500).json({
+          success: false,
+          error: "Email OTP service is not configured (API_SECRET_KEY/SESSION_SECRET missing)."
+        });
+      }
+
+      const { email, otp } = req.body || {};
       const cleanEmail = String(email || "").trim().toLowerCase();
       const cleanOtp = String(otp || "").trim();
 
       if (!cleanEmail || !cleanEmail.includes("@")) {
         return res.status(400).json({ success: false, error: "A valid email address is required." });
       }
-      if (!cleanOtp || cleanOtp.length !== 6) {
+      if (!/^\d{6}$/.test(cleanOtp)) {
         return res.status(400).json({ success: false, error: "Please enter the complete 6-digit OTP code." });
       }
 
-      // 1. Primary check: in-memory cache
-      const cached = emailOtpStore.get(cleanEmail);
-      if (cached) {
-        if (Date.now() > cached.expiresAt) {
-          emailOtpStore.delete(cleanEmail);
-          return res.status(400).json({
-            success: false,
-            error: "Verification code has expired. Please request a fresh OTP."
-          });
+      const sb = getServerSupabase();
+      const clearStoredOtp = async () => {
+        emailOtpStore.delete(cleanEmail);
+        if (sb) {
+          try {
+            await sb.from("email_otps").delete().eq("email", cleanEmail);
+          } catch {}
         }
+      };
 
-        cached.attempts += 1;
-        if (cached.attempts > 5) {
-          emailOtpStore.delete(cleanEmail);
-          return res.status(400).json({
-            success: false,
-            error: "Too many invalid attempts. Please request a new OTP code."
-          });
-        }
+      // Load active server-side OTP record (Supabase `email_otps` primary -> hashed in-memory fallback)
+      let activeRecord: { otpHash: string; expiresAt: number; attempts: number } | null = null;
+      let loadedFromDb = false;
 
-        if (cached.otp === cleanOtp) {
-          emailOtpStore.delete(cleanEmail);
-          return res.json({
-            success: true,
-            verified: true,
-            message: "Email verification code verified successfully."
-          });
+      if (sb) {
+        try {
+          const { data: dbRow, error: dbErr } = await sb
+            .from("email_otps")
+            .select("otp_hash, expires_at, attempts")
+            .eq("email", cleanEmail)
+            .maybeSingle();
+
+          if (!dbErr && dbRow && dbRow.otp_hash) {
+            loadedFromDb = true;
+            activeRecord = {
+              otpHash: String(dbRow.otp_hash),
+              expiresAt: new Date(dbRow.expires_at).getTime(),
+              attempts: Number(dbRow.attempts || 0)
+            };
+          }
+        } catch {}
+      }
+
+      if (!activeRecord) {
+        const memRow = emailOtpStore.get(cleanEmail);
+        if (memRow) {
+          activeRecord = {
+            otpHash: memRow.otpHash,
+            expiresAt: memRow.expiresAt,
+            attempts: memRow.attempts
+          };
         }
       }
 
-      // 2. Secondary check: Cryptographic HMAC signature token (cross-container/serverless resilience)
-      if (token && expiresAt && Number(expiresAt) > Date.now()) {
-        const secret = process.env.API_SECRET_KEY || 'smartrun_email_otp_secret_key_kasba';
-        const expectedSig = crypto.createHmac('sha256', secret)
-          .update(`${cleanEmail}:${cleanOtp}:${expiresAt}`)
-          .digest('hex');
-
-        if (token === expectedSig) {
-          emailOtpStore.delete(cleanEmail);
-          return res.json({
-            success: true,
-            verified: true,
-            message: "Email verification code verified successfully."
-          });
-        }
-      }
-
-      if (!cached && (!token || !expiresAt)) {
+      if (!activeRecord) {
         return res.status(400).json({
           success: false,
           error: "No active verification code found or code expired. Please request a new OTP."
         });
+      }
+
+      if (Date.now() > activeRecord.expiresAt) {
+        await clearStoredOtp();
+        return res.status(400).json({
+          success: false,
+          error: "Verification code has expired. Please request a fresh OTP."
+        });
+      }
+
+      // Enforce max 5 attempts per email on every verify path
+      const nextAttempts = activeRecord.attempts + 1;
+      if (activeRecord.attempts >= MAX_EMAIL_OTP_ATTEMPTS || nextAttempts > MAX_EMAIL_OTP_ATTEMPTS) {
+        await clearStoredOtp();
+        return res.status(429).json({
+          success: false,
+          error: "Too many invalid attempts. Please request a new OTP code."
+        });
+      }
+
+      const isValid = verifyEmailOtpHash(cleanEmail, cleanOtp, activeRecord.otpHash, EMAIL_OTP_HMAC_SECRET);
+
+      if (isValid) {
+        await clearStoredOtp();
+        return res.json({
+          success: true,
+          verified: true,
+          message: "Email verification code verified successfully."
+        });
+      }
+
+      // On failed guess: invalidate immediately if 5th attempt was just used, else persist incremented count
+      if (nextAttempts >= MAX_EMAIL_OTP_ATTEMPTS) {
+        await clearStoredOtp();
+        return res.status(429).json({
+          success: false,
+          error: "Too many invalid attempts. Please request a new OTP code."
+        });
+      }
+
+      const memEntry = emailOtpStore.get(cleanEmail);
+      if (memEntry) {
+        memEntry.attempts = nextAttempts;
+      } else {
+        emailOtpStore.set(cleanEmail, {
+          otpHash: activeRecord.otpHash,
+          expiresAt: activeRecord.expiresAt,
+          attempts: nextAttempts
+        });
+      }
+
+      if (sb && loadedFromDb) {
+        try {
+          await sb
+            .from("email_otps")
+            .update({ attempts: nextAttempts, updated_at: new Date().toISOString() })
+            .eq("email", cleanEmail);
+        } catch {}
       }
 
       return res.status(400).json({
@@ -9369,10 +9661,7 @@ Knowledge Base & Service Details:
       const effectiveUserId = preResolvedUserId || existing?.user_id || `uid_${cleanPhone}`;
       const resolvedName = existing?.full_name || existing?.name || fullName || "Customer";
       const resolvedEmail = existing?.email && !existing.email.includes("@girirajpower.internal") ? existing.email : "";
-      const isUserAdmin = Boolean(
-        (resolvedEmail && ADMIN_EMAILS.includes(resolvedEmail.toLowerCase())) || cleanPhone === "8777400280"
-      );
-      const userRole = isUserAdmin ? "admin" : "customer";
+      const userRole: "customer" = "customer";
 
       if (sb?.auth?.admin) {
         try {
@@ -9759,12 +10048,7 @@ Knowledge Base & Service Details:
         if (prof) userProfile = prof;
       } catch {}
 
-      const cleanPhoneDigits = (resolvedPhone || "").replace(/\D/g, "").slice(-10);
-      const isUserAdmin = Boolean(
-        (targetEmail && !targetEmail.includes("@girirajpower.internal") && ADMIN_EMAILS.includes(targetEmail.toLowerCase())) ||
-        cleanPhoneDigits === "8777400280"
-      );
-      const userRole = isUserAdmin ? "admin" : "customer";
+      const userRole: "customer" = "customer";
 
       // Mint server-authoritative session
       const sessionToken = createServerSessionToken({
@@ -10410,12 +10694,7 @@ Knowledge Base & Service Details:
         updatedCred.userEmail ||
         "";
       const resolvedEmail = rawEmail && !rawEmail.includes("@girirajpower.internal") ? rawEmail : "";
-      const cleanDigits = resolvedPhone.replace(/\D/g, "").slice(-10);
-      const isUserAdmin = Boolean(
-        (resolvedEmail && ADMIN_EMAILS.includes(resolvedEmail.toLowerCase())) ||
-        cleanDigits === "8777400280"
-      );
-      const userRole: "admin" | "customer" = isUserAdmin ? "admin" : "customer";
+      const userRole: "customer" = "customer";
 
       // Mint authoritative server session token & httpOnly cookie (works on both Web & Android App)
       const sessionToken = createServerSessionToken({
