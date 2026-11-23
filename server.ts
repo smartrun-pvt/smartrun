@@ -57,7 +57,12 @@ import {
   parseOptionalRefundAmount,
   isTestRefundPayment,
   isSimulatedRefundAllowed,
-  validateNonAdminRefundRequest
+  validateNonAdminRefundRequest,
+  normalizeCartItemsForPricing,
+  verifyFetchedRazorpayOrder,
+  sanitizeRazorpayOrderNotes,
+  evaluateRazorpayWebhookOrderUpdate,
+  decideEmailOtpVerificationOutcome
 } from "./src/utils/orderSecurity";
 
 dotenv.config();
@@ -3902,94 +3907,19 @@ async function startServer() {
       const validatedOrder = parseResult.data;
       const sb = getServerSupabase();
 
-      // 2.1 Server-Authoritative Product Price Lookup (Supabase `products` table -> fallback to server product cache)
+      // 2.1 + 2.2 Server-Authoritative Product Price Lookup & Dynamic Charges (shared with /api/razorpay/create-order)
       // Never trust client product.price, fees, discount, or totalAmount.
-      const uniqueProductIds = Array.from(
-        new Set(
-          validatedOrder.items
-            .map((it) => String(it.product?.id || "").trim())
-            .filter(Boolean)
-        )
-      );
-
-      const dbProductsById = new Map<string, Record<string, any>>();
-      if (sb && uniqueProductIds.length > 0) {
-        try {
-          const { data: dbProducts, error: dbProdError } = await sb
-            .from("products")
-            .select("*")
-            .in("id", uniqueProductIds);
-          if (!dbProdError && Array.isArray(dbProducts)) {
-            for (const prod of dbProducts) {
-              if (prod && prod.id !== undefined && prod.id !== null) {
-                dbProductsById.set(String(prod.id), prod);
-              }
-            }
-          } else if (dbProdError) {
-            console.warn("[Server /api/order Product Lookup Notice]:", dbProdError.message);
-          }
-        } catch (prodQueryErr) {
-          console.warn("[Server /api/order Product Lookup Error]:", prodQueryErr);
-        }
-      }
-
-      const cachedProductsById = new Map<string, Record<string, any>>();
-      const hasMissingProductFromDb = uniqueProductIds.some((id) => !dbProductsById.has(id));
-      if (hasMissingProductFromDb) {
-        if (catalogCache && Array.isArray(catalogCache.products) && catalogCache.products.length > 0) {
-          for (const prod of catalogCache.products) {
-            if (prod && prod.id !== undefined && prod.id !== null) {
-              cachedProductsById.set(String(prod.id), prod);
-            }
-          }
-        }
-        const stillMissing = uniqueProductIds.some(
-          (id) => !dbProductsById.has(id) && !cachedProductsById.has(id)
-        );
-        if (stillMissing) {
-          try {
-            const cached = await getCachedCatalog(false);
-            if (Array.isArray(cached.products)) {
-              for (const prod of cached.products) {
-                if (prod && prod.id !== undefined && prod.id !== null) {
-                  cachedProductsById.set(String(prod.id), prod);
-                }
-              }
-            }
-          } catch (cacheErr) {
-            console.warn("[Server /api/order Catalog Cache Fallback Notice]:", cacheErr);
-          }
-        }
-      }
-
-      const resolvedItemsResult = resolveAuthoritativeOrderItems(
-        validatedOrder.items,
-        dbProductsById,
-        cachedProductsById
-      );
-
-      if (!resolvedItemsResult.ok || !("items" in resolvedItemsResult)) {
-        const failureReason =
-          "reason" in resolvedItemsResult
-            ? resolvedItemsResult.reason
-            : "One or more products in the order could not be verified.";
+      const pricingResult = await computeServerAuthoritativeOrderPricing(validatedOrder.items, sb);
+      if (!("grandTotal" in pricingResult)) {
         return res.status(400).json({
           success: false,
-          message: failureReason
+          message: pricingResult.reason
         });
       }
 
-      const serverPricingItems = resolvedItemsResult.items.map((item) => item.pricingItem);
-      const formattedServerItems = resolvedItemsResult.items.map((item) => item.formattedItem);
-      const serverItemTotal = resolvedItemsResult.itemTotal;
-
-      // 2.2 Compute fees and grandTotal strictly from server-computed subtotal and server fee policy only
-      const dynamicCharges = computeOrderCharges(
-        serverPricingItems,
-        serverItemTotal,
-        getServerFeePolicy()
-      );
-
+      const formattedServerItems = pricingResult.formattedServerItems;
+      const serverItemTotal = pricingResult.serverItemTotal;
+      const dynamicCharges = pricingResult.dynamicCharges;
       const effectiveDeliveryFee = dynamicCharges.deliveryFee;
       const effectiveHandlingFee = dynamicCharges.handlingFee;
       const effectiveRainFee = dynamicCharges.rainFee;
@@ -3997,7 +3927,7 @@ async function startServer() {
       const effectiveProductFee = dynamicCharges.totalProductCharges;
       const effectiveTotalFees = dynamicCharges.totalFees;
       const serverDiscount = 0;
-      const serverGrandTotal = dynamicCharges.grandTotal;
+      const serverGrandTotal = pricingResult.grandTotal;
 
       // 2.3 Ignore client paymentStatus; verify Razorpay HMAC-SHA256 using crypto.timingSafeEqual
       const razorpayOrderId = validatedOrder.razorpay_order_id || validatedOrder.razorpayOrderId || null;
@@ -4007,13 +3937,52 @@ async function startServer() {
         .trim()
         .replace(/^['"]|['"]$/g, "");
 
-      const serverPaymentStatus = verifyRazorpayOrderPaymentStatus({
+      const signaturePaymentStatus = verifyRazorpayOrderPaymentStatus({
         paymentMethod: validatedOrder.paymentMethod,
         razorpayOrderId,
         razorpayPaymentId,
         razorpaySignature,
         keySecret: razorpayKeySecret
       });
+
+      let serverPaymentStatus: "paid" | "pending" = signaturePaymentStatus;
+      let razorpayAmountVerificationError: string | null = null;
+
+      // 2.4 For verified upi/card signatures, also fetch the Razorpay order from Razorpay API
+      // and require exact amount match (in paise), currency === "INR", and amount_paid >= amount.
+      const normalizedPaymentMethod = String(validatedOrder.paymentMethod || "").trim().toLowerCase();
+      if (
+        (normalizedPaymentMethod === "upi" || normalizedPaymentMethod === "card") &&
+        signaturePaymentStatus === "paid"
+      ) {
+        const expectedAmountInPaise = Math.round(serverGrandTotal * 100);
+        const razorpay = getRazorpayClient();
+        if (!razorpay) {
+          serverPaymentStatus = "pending";
+          razorpayAmountVerificationError =
+            "Payment verification failed: Razorpay client is not configured on the server.";
+        } else {
+          try {
+            const fetchedRazorpayOrder = await razorpay.orders.fetch(String(razorpayOrderId));
+            const rzpOrderCheck = verifyFetchedRazorpayOrder({
+              fetchedOrder: fetchedRazorpayOrder as unknown as Record<string, any>,
+              expectedAmountInPaise
+            });
+            if (!("ok" in rzpOrderCheck) || !rzpOrderCheck.ok) {
+              serverPaymentStatus = "pending";
+              razorpayAmountVerificationError =
+                "reason" in rzpOrderCheck
+                  ? rzpOrderCheck.reason
+                  : "Razorpay order amount or payment status could not be verified.";
+            }
+          } catch (rzpFetchErr: any) {
+            console.error("[Server /api/order Razorpay Order Fetch Error]:", rzpFetchErr?.error || rzpFetchErr?.message || rzpFetchErr);
+            serverPaymentStatus = "pending";
+            razorpayAmountVerificationError =
+              "Payment verification failed: could not verify the paid Razorpay order amount with Razorpay.";
+          }
+        }
+      }
 
       const orderDbId = validatedOrder.id;
       const cleanHex = orderDbId.replace(/[^a-zA-Z0-9]/g, "");
@@ -4049,7 +4018,7 @@ async function startServer() {
         razorpay_signature: razorpaySignature
       };
 
-      // 3. Ownership Check & Database Insert (never upsert over another user's order)
+      // 3. Ownership Check, Razorpay Payment/Order Reuse Check & Database Insert
       let isExistingSameUserOrder = false;
 
       if (sb) {
@@ -4074,6 +4043,66 @@ async function startServer() {
           }
         } catch (lookupErr) {
           console.warn("[Server /api/order Ownership Lookup Error]:", lookupErr);
+        }
+
+        // 3.1 Reject reuse: check if razorpay_payment_id or razorpay_order_id is already linked to a different order
+        if (razorpayPaymentId) {
+          let { data: reusedPaymentRows, error: reusedPaymentErr } = await sb
+            .from("orders")
+            .select("id")
+            .eq("razorpay_payment_id", razorpayPaymentId)
+            .neq("id", orderDbId)
+            .limit(1);
+
+          if (reusedPaymentErr && reusedPaymentErr.code === "42703") {
+            const fallbackRes = await sb
+              .from("orders")
+              .select("id")
+              .eq("payment_id", razorpayPaymentId)
+              .neq("id", orderDbId)
+              .limit(1);
+            reusedPaymentRows = fallbackRes.data;
+            reusedPaymentErr = fallbackRes.error;
+          }
+
+          if (reusedPaymentErr) {
+            console.error("[Server /api/order Payment Reuse Lookup Error]:", reusedPaymentErr);
+            return res.status(500).json({
+              success: false,
+              message: "Unable to verify Razorpay payment uniqueness."
+            });
+          }
+
+          if (Array.isArray(reusedPaymentRows) && reusedPaymentRows.length > 0) {
+            return res.status(409).json({
+              success: false,
+              message: "Payment conflict: this Razorpay payment ID has already been used for another order."
+            });
+          }
+        }
+
+        if (razorpayOrderId) {
+          const { data: reusedRzpOrderRows, error: reusedRzpOrderErr } = await sb
+            .from("orders")
+            .select("id")
+            .eq("razorpay_order_id", razorpayOrderId)
+            .neq("id", orderDbId)
+            .limit(1);
+
+          if (reusedRzpOrderErr && reusedRzpOrderErr.code !== "42703") {
+            console.error("[Server /api/order Razorpay Order Reuse Lookup Error]:", reusedRzpOrderErr);
+            return res.status(500).json({
+              success: false,
+              message: "Unable to verify Razorpay order uniqueness."
+            });
+          }
+
+          if (!reusedRzpOrderErr && Array.isArray(reusedRzpOrderRows) && reusedRzpOrderRows.length > 0) {
+            return res.status(409).json({
+              success: false,
+              message: "Payment conflict: this Razorpay order ID has already been used for another order."
+            });
+          }
         }
 
         if (!isExistingSameUserOrder) {
@@ -4121,6 +4150,13 @@ async function startServer() {
 
             if (insertError) {
               if (insertError.code === "23505") {
+                const errDetail = `${insertError.message || ""} ${insertError.details || ""}`.toLowerCase();
+                if (errDetail.includes("razorpay_payment_id") || errDetail.includes("razorpay_order_id")) {
+                  return res.status(409).json({
+                    success: false,
+                    message: "Payment conflict: this Razorpay payment has already been used for another order."
+                  });
+                }
                 const { data: conflictingOrder } = await sb
                   .from("orders")
                   .select("id, user_id")
@@ -4142,6 +4178,16 @@ async function startServer() {
             console.warn("[Server /api/order DB Insert Notice]:", dbErr);
           }
         }
+      }
+
+      // If Razorpay order amount / currency / paid-amount check failed, order has been saved as "pending"; reject with 400
+      if (razorpayAmountVerificationError) {
+        return res.status(400).json({
+          success: false,
+          orderId: orderDbId,
+          paymentStatus: "pending",
+          message: razorpayAmountVerificationError
+        });
       }
 
       // 4. Automated Notifications (Resend Email + WhatsApp) using server-computed totals
@@ -4860,20 +4906,147 @@ async function startServer() {
     });
   });
 
-  // 2. POST /api/razorpay/create-order - Create Razorpay order on the server
+  // Shared server-authoritative catalog pricing helper (used by both /api/order and /api/razorpay/create-order)
+  async function computeServerAuthoritativeOrderPricing(
+    items: Array<{
+      quantity: number;
+      selectedColor?: string;
+      product: { id: string; selectedColor?: string; [key: string]: any };
+    }>,
+    sb: ReturnType<typeof getServerSupabase>
+  ) {
+    const uniqueProductIds = Array.from(
+      new Set(
+        items
+          .map((it) => String(it.product?.id || "").trim())
+          .filter(Boolean)
+      )
+    );
+
+    const dbProductsById = new Map<string, Record<string, any>>();
+    if (sb && uniqueProductIds.length > 0) {
+      try {
+        const { data: dbProducts, error: dbProdError } = await sb
+          .from("products")
+          .select("*")
+          .in("id", uniqueProductIds);
+        if (!dbProdError && Array.isArray(dbProducts)) {
+          for (const prod of dbProducts) {
+            if (prod && prod.id !== undefined && prod.id !== null) {
+              dbProductsById.set(String(prod.id), prod);
+            }
+          }
+        } else if (dbProdError) {
+          console.warn("[Server Authoritative Pricing Product Lookup Notice]:", dbProdError.message);
+        }
+      } catch (prodQueryErr) {
+        console.warn("[Server Authoritative Pricing Product Lookup Error]:", prodQueryErr);
+      }
+    }
+
+    const cachedProductsById = new Map<string, Record<string, any>>();
+    const hasMissingProductFromDb = uniqueProductIds.some((id) => !dbProductsById.has(id));
+    if (hasMissingProductFromDb) {
+      if (catalogCache && Array.isArray(catalogCache.products) && catalogCache.products.length > 0) {
+        for (const prod of catalogCache.products) {
+          if (prod && prod.id !== undefined && prod.id !== null) {
+            cachedProductsById.set(String(prod.id), prod);
+          }
+        }
+      }
+      const stillMissing = uniqueProductIds.some(
+        (id) => !dbProductsById.has(id) && !cachedProductsById.has(id)
+      );
+      if (stillMissing) {
+        try {
+          const cached = await getCachedCatalog(false);
+          if (Array.isArray(cached.products)) {
+            for (const prod of cached.products) {
+              if (prod && prod.id !== undefined && prod.id !== null) {
+                cachedProductsById.set(String(prod.id), prod);
+              }
+            }
+          }
+        } catch (cacheErr) {
+          console.warn("[Server Authoritative Pricing Cache Fallback Notice]:", cacheErr);
+        }
+      }
+    }
+
+    const resolvedItemsResult = resolveAuthoritativeOrderItems(
+      items,
+      dbProductsById,
+      cachedProductsById
+    );
+
+    if (!resolvedItemsResult.ok || !("items" in resolvedItemsResult)) {
+      const failureReason =
+        "reason" in resolvedItemsResult
+          ? resolvedItemsResult.reason
+          : "One or more products in the order could not be verified.";
+      return { ok: false as const, reason: failureReason };
+    }
+
+    const serverPricingItems = resolvedItemsResult.items.map((item) => item.pricingItem);
+    const formattedServerItems = resolvedItemsResult.items.map((item) => item.formattedItem);
+    const serverItemTotal = resolvedItemsResult.itemTotal;
+
+    const dynamicCharges = computeOrderCharges(
+      serverPricingItems,
+      serverItemTotal,
+      getServerFeePolicy()
+    );
+
+    return {
+      ok: true as const,
+      formattedServerItems,
+      serverItemTotal,
+      dynamicCharges,
+      grandTotal: dynamicCharges.grandTotal
+    };
+  }
+
+  // 2. POST /api/razorpay/create-order - Create Razorpay order using strictly server-computed cart total
   app.post("/api/razorpay/create-order", async (req, res) => {
     res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
     try {
-      const { amount, receipt, notes } = req.body || {};
-      const parsedAmount = Number(amount);
-      if (isNaN(parsedAmount) || parsedAmount <= 0) {
+      const authUser = await getAuthenticatedUser(req);
+      if (!authUser || !authUser.id) {
+        return res.status(401).json({
+          success: false,
+          message: "Authentication required to create a Razorpay payment order."
+        });
+      }
+      const authenticatedUserId = String(authUser.id).trim();
+
+      // Never trust client-supplied `amount`; compute strictly from cart items + selected colors
+      const { items, cartItems, receipt, notes } = req.body || {};
+      const normalizedItems = normalizeCartItemsForPricing(items ?? cartItems);
+      if (normalizedItems.length === 0) {
         return res.status(400).json({
           success: false,
-          message: "A valid positive amount in rupees is required."
+          message: "Valid cart items (product id, quantity, and optional selectedColor) are required to create a payment order."
         });
       }
 
-      const amountInPaise = Math.round(parsedAmount * 100);
+      const sb = getServerSupabase();
+      const pricingResult = await computeServerAuthoritativeOrderPricing(normalizedItems, sb);
+      if (!("grandTotal" in pricingResult)) {
+        return res.status(400).json({
+          success: false,
+          message: pricingResult.reason
+        });
+      }
+
+      const serverGrandTotal = pricingResult.grandTotal;
+      if (!Number.isFinite(serverGrandTotal) || serverGrandTotal <= 0) {
+        return res.status(400).json({
+          success: false,
+          message: "Computed order total must be greater than zero."
+        });
+      }
+
+      const amountInPaise = Math.round(serverGrandTotal * 100);
       const activeKeyId = resolveRazorpayKeyId();
       const rawKeyId = resolveRawRazorpayKeyId();
 
@@ -4897,13 +5070,19 @@ async function startServer() {
         });
       }
 
+      const safeReceipt =
+        typeof receipt === "string" && receipt.trim()
+          ? receipt.trim().slice(0, 40)
+          : `rcpt_${Date.now()}`;
+      const safeNotes = sanitizeRazorpayOrderNotes(notes, authenticatedUserId);
+
       try {
         const orderOptions = {
           amount: amountInPaise,
           currency: "INR",
-          receipt: receipt || `rcpt_${Date.now()}`,
+          receipt: safeReceipt,
           payment_capture: 1,
-          notes: notes || {}
+          notes: safeNotes
         };
         const order = await razorpay.orders.create(orderOptions);
         return res.status(200).json({
@@ -5292,29 +5471,64 @@ async function startServer() {
 
         const paymentId = paymentEntity?.id;
         const razorpayOrderId = paymentEntity?.order_id || orderEntity?.id;
-        const amount = paymentEntity?.amount ? paymentEntity.amount / 100 : undefined;
+        const paymentAmountPaise = paymentEntity?.amount;
+        const amount = typeof paymentAmountPaise === "number" ? paymentAmountPaise / 100 : undefined;
 
         console.log(`[Razorpay Webhook] Payment confirmed: ${paymentId} for order ${razorpayOrderId} (₹${amount})`);
 
-        // If Supabase is initialized on backend, update order payment status
+        // If Supabase is initialized on backend, validate order total & status before updating
         const sb = getServerSupabase();
         if (sb && razorpayOrderId) {
           try {
-            const { error: updateErr } = await sb
+            const { data: existingOrder, error: loadErr } = await sb
               .from("orders")
-              .update({
-                payment_status: "paid",
-                status: "accepted",
-                razorpay_payment_id: paymentId,
-                payment_id: paymentId,
-                updated_at: new Date().toISOString()
-              })
-              .eq("razorpay_order_id", razorpayOrderId);
+              .select("id, status, payment_status, total_amount")
+              .eq("razorpay_order_id", razorpayOrderId)
+              .maybeSingle();
 
-            if (updateErr) {
-              console.warn("[Razorpay Webhook] Notice updating order in Supabase:", updateErr.message);
+            if (loadErr) {
+              console.warn("[Razorpay Webhook] Error loading order from Supabase:", loadErr.message);
             } else {
-              console.log(`[Razorpay Webhook] Order ${razorpayOrderId} successfully updated to 'paid' ('accepted') in Supabase.`);
+              const decision = evaluateRazorpayWebhookOrderUpdate({
+                existingOrder,
+                paymentAmountPaise
+              });
+
+              if (decision.action === "skip") {
+                console.warn(
+                  `[Razorpay Webhook] Skipping order ${razorpayOrderId}: ${decision.reason}`
+                );
+              } else {
+                const updatePayload: Record<string, any> = {
+                  payment_status: "paid",
+                  razorpay_payment_id: paymentId,
+                  payment_id: paymentId,
+                  updated_at: new Date().toISOString()
+                };
+                if (decision.setStatusAccepted) {
+                  updatePayload.status = "accepted";
+                }
+
+                let updateQuery = sb
+                  .from("orders")
+                  .update(updatePayload)
+                  .eq("razorpay_order_id", razorpayOrderId)
+                  .eq("payment_status", "pending");
+
+                if (decision.requirePendingStatus) {
+                  updateQuery = updateQuery.eq("status", "pending");
+                }
+
+                const { error: updateErr } = await updateQuery;
+
+                if (updateErr) {
+                  console.warn("[Razorpay Webhook] Notice updating order in Supabase:", updateErr.message);
+                } else {
+                  console.log(
+                    `[Razorpay Webhook] Order ${razorpayOrderId} updated to payment_status='paid'${decision.setStatusAccepted ? " (status='accepted')" : " (status preserved)"} in Supabase.`
+                  );
+                }
+              }
             }
           } catch (dbErr) {
             console.warn("[Razorpay Webhook] DB error:", dbErr);
@@ -9302,108 +9516,131 @@ Knowledge Base & Service Details:
         }
       };
 
-      // Load active server-side OTP record (Supabase `email_otps` primary -> hashed in-memory fallback)
-      let activeRecord: { otpHash: string; expiresAt: number; attempts: number } | null = null;
-      let loadedFromDb = false;
+      // Atomically increment attempts in a single Supabase RPC call (attempts < MAX_EMAIL_OTP_ATTEMPTS)
+      // so concurrent verification requests cannot bypass the max-attempt limit.
+      let found = false;
+      let limitReached = false;
+      let attemptsAfterIncrement = 0;
+      let otpHashToCheck: string | null = null;
+      let usedDbAtomicIncrement = false;
 
       if (sb) {
         try {
-          const { data: dbRow, error: dbErr } = await sb
-            .from("email_otps")
-            .select("otp_hash, expires_at, attempts")
-            .eq("email", cleanEmail)
-            .maybeSingle();
+          const { data: rpcRows, error: rpcErr } = await sb.rpc("increment_email_otp_attempts", {
+            p_email: cleanEmail,
+            p_max_attempts: MAX_EMAIL_OTP_ATTEMPTS
+          });
 
-          if (!dbErr && dbRow && dbRow.otp_hash) {
-            loadedFromDb = true;
-            activeRecord = {
-              otpHash: String(dbRow.otp_hash),
-              expiresAt: new Date(dbRow.expires_at).getTime(),
-              attempts: Number(dbRow.attempts || 0)
-            };
+          if (!rpcErr) {
+            usedDbAtomicIncrement = true;
+            const row = Array.isArray(rpcRows) ? rpcRows[0] : rpcRows;
+            if (row) {
+              found = true;
+              limitReached = Boolean(row.limit_reached);
+              attemptsAfterIncrement = Number(row.attempts || 0);
+              otpHashToCheck = row.otp_hash ? String(row.otp_hash) : null;
+            }
+          } else {
+            // Fallback when RPC migration has not yet been applied: conditional single-row CAS update
+            const { data: existingRow, error: readErr } = await sb
+              .from("email_otps")
+              .select("otp_hash, expires_at, attempts")
+              .eq("email", cleanEmail)
+              .maybeSingle();
+
+            if (!readErr && existingRow) {
+              usedDbAtomicIncrement = true;
+              const expiresMs = new Date(existingRow.expires_at).getTime();
+              const currentAttempts = Number(existingRow.attempts || 0);
+              if (Date.now() > expiresMs) {
+                await clearStoredOtp();
+                found = false;
+              } else if (currentAttempts >= MAX_EMAIL_OTP_ATTEMPTS) {
+                found = true;
+                limitReached = true;
+                attemptsAfterIncrement = currentAttempts;
+              } else {
+                const { data: casRow, error: casErr } = await sb
+                  .from("email_otps")
+                  .update({
+                    attempts: currentAttempts + 1,
+                    updated_at: new Date().toISOString()
+                  })
+                  .eq("email", cleanEmail)
+                  .eq("attempts", currentAttempts)
+                  .lt("attempts", MAX_EMAIL_OTP_ATTEMPTS)
+                  .select("otp_hash, expires_at, attempts")
+                  .maybeSingle();
+
+                if (!casErr && casRow) {
+                  found = true;
+                  limitReached = false;
+                  attemptsAfterIncrement = Number(casRow.attempts || currentAttempts + 1);
+                  otpHashToCheck = casRow.otp_hash ? String(casRow.otp_hash) : null;
+                } else {
+                  // Concurrent request won the CAS race -> fail closed without allowing extra guesses
+                  found = true;
+                  limitReached = true;
+                  attemptsAfterIncrement = MAX_EMAIL_OTP_ATTEMPTS;
+                }
+              }
+            }
           }
-        } catch {}
-      }
-
-      if (!activeRecord) {
-        const memRow = emailOtpStore.get(cleanEmail);
-        if (memRow) {
-          activeRecord = {
-            otpHash: memRow.otpHash,
-            expiresAt: memRow.expiresAt,
-            attempts: memRow.attempts
-          };
+        } catch (dbOtpErr) {
+          console.warn("[Email OTP Atomic Increment Notice]:", dbOtpErr);
         }
       }
 
-      if (!activeRecord) {
-        return res.status(400).json({
-          success: false,
-          error: "No active verification code found or code expired. Please request a new OTP."
-        });
+      // Synchronous in-memory fallback (atomic in single-threaded Node.js event loop)
+      if (!usedDbAtomicIncrement) {
+        const memRow = emailOtpStore.get(cleanEmail);
+        if (memRow) {
+          if (Date.now() > memRow.expiresAt) {
+            emailOtpStore.delete(cleanEmail);
+            found = false;
+          } else if (memRow.attempts >= MAX_EMAIL_OTP_ATTEMPTS) {
+            found = true;
+            limitReached = true;
+            attemptsAfterIncrement = memRow.attempts;
+            emailOtpStore.delete(cleanEmail);
+          } else {
+            memRow.attempts += 1;
+            found = true;
+            limitReached = false;
+            attemptsAfterIncrement = memRow.attempts;
+            otpHashToCheck = memRow.otpHash;
+          }
+        }
       }
 
-      if (Date.now() > activeRecord.expiresAt) {
+      const isHashValid =
+        found && !limitReached && Boolean(otpHashToCheck)
+          ? verifyEmailOtpHash(cleanEmail, cleanOtp, otpHashToCheck, EMAIL_OTP_HMAC_SECRET)
+          : false;
+
+      const outcome = decideEmailOtpVerificationOutcome({
+        found,
+        limitReached,
+        attemptsAfterIncrement,
+        maxAttempts: MAX_EMAIL_OTP_ATTEMPTS,
+        isHashValid
+      });
+
+      if (outcome.clearOtp) {
         await clearStoredOtp();
-        return res.status(400).json({
-          success: false,
-          error: "Verification code has expired. Please request a fresh OTP."
-        });
       }
 
-      // Enforce max 5 attempts per email on every verify path
-      const nextAttempts = activeRecord.attempts + 1;
-      if (activeRecord.attempts >= MAX_EMAIL_OTP_ATTEMPTS || nextAttempts > MAX_EMAIL_OTP_ATTEMPTS) {
-        await clearStoredOtp();
-        return res.status(429).json({
-          success: false,
-          error: "Too many invalid attempts. Please request a new OTP code."
-        });
-      }
-
-      const isValid = verifyEmailOtpHash(cleanEmail, cleanOtp, activeRecord.otpHash, EMAIL_OTP_HMAC_SECRET);
-
-      if (isValid) {
-        await clearStoredOtp();
+      if (outcome.verified) {
         return res.json({
           success: true,
           verified: true,
-          message: "Email verification code verified successfully."
+          message: outcome.message
         });
       }
 
-      // On failed guess: invalidate immediately if 5th attempt was just used, else persist incremented count
-      if (nextAttempts >= MAX_EMAIL_OTP_ATTEMPTS) {
-        await clearStoredOtp();
-        return res.status(429).json({
-          success: false,
-          error: "Too many invalid attempts. Please request a new OTP code."
-        });
-      }
-
-      const memEntry = emailOtpStore.get(cleanEmail);
-      if (memEntry) {
-        memEntry.attempts = nextAttempts;
-      } else {
-        emailOtpStore.set(cleanEmail, {
-          otpHash: activeRecord.otpHash,
-          expiresAt: activeRecord.expiresAt,
-          attempts: nextAttempts
-        });
-      }
-
-      if (sb && loadedFromDb) {
-        try {
-          await sb
-            .from("email_otps")
-            .update({ attempts: nextAttempts, updated_at: new Date().toISOString() })
-            .eq("email", cleanEmail);
-        } catch {}
-      }
-
-      return res.status(400).json({
+      return res.status(outcome.status).json({
         success: false,
-        error: "Incorrect verification code. Please check the code sent to your email."
+        error: "error" in outcome ? outcome.error : "Email OTP verification failed."
       });
     } catch (err: any) {
       return res.status(500).json({

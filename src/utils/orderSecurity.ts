@@ -676,3 +676,273 @@ export function validateNonAdminRefundRequest(params: {
   return { ok: true, effectiveAmount: orderTotal, orderTotal };
 }
 
+/**
+ * Normalizes cart items from request bodies (supporting both nested `{ product: { id }, quantity, selectedColor }`
+ * and flat `{ productId / id, quantity, selectedColor }` shapes) for authoritative server pricing.
+ * Strips client price/fee fields so pricing always comes from the server catalog.
+ */
+export function normalizeCartItemsForPricing(rawItems: unknown): AuthoritativeItemResolutionInput[] {
+  if (!Array.isArray(rawItems)) {
+    return [];
+  }
+
+  const normalized: AuthoritativeItemResolutionInput[] = [];
+  for (const entry of rawItems) {
+    if (!entry || typeof entry !== "object") {
+      return [];
+    }
+    const item = entry as Record<string, any>;
+    const nestedProduct =
+      item.product && typeof item.product === "object" && !Array.isArray(item.product)
+        ? (item.product as Record<string, any>)
+        : null;
+
+    const productId = String(nestedProduct?.id ?? item.productId ?? item.id ?? "").trim();
+    const quantity = Number(item.quantity);
+    const selectedColorRaw =
+      item.selectedColor ?? item.color ?? nestedProduct?.selectedColor ?? nestedProduct?.color;
+    const selectedColor =
+      typeof selectedColorRaw === "string" && selectedColorRaw.trim()
+        ? selectedColorRaw.trim()
+        : undefined;
+
+    if (!productId || !Number.isInteger(quantity) || quantity <= 0 || quantity > 1000) {
+      return [];
+    }
+
+    normalized.push({
+      quantity,
+      selectedColor,
+      product: {
+        id: productId,
+        selectedColor,
+      },
+    });
+  }
+
+  return normalized;
+}
+
+/**
+ * Verifies a Razorpay order object returned by `razorpay.orders.fetch(razorpayOrderId)`
+ * against the server-computed grand total in paise:
+ * - `order.amount === expectedAmountInPaise`
+ * - `order.currency === "INR"`
+ * - `order.amount_paid >= order.amount`
+ */
+export function verifyFetchedRazorpayOrder(params: {
+  fetchedOrder: Record<string, any> | null | undefined;
+  expectedAmountInPaise: number;
+}): { ok: true } | { ok: false; reason: string } {
+  const { fetchedOrder, expectedAmountInPaise } = params;
+
+  if (!Number.isInteger(expectedAmountInPaise) || expectedAmountInPaise <= 0) {
+    return {
+      ok: false,
+      reason: "Invalid server-computed order amount for payment verification.",
+    };
+  }
+
+  if (!fetchedOrder || typeof fetchedOrder !== "object") {
+    return {
+      ok: false,
+      reason: "Unable to retrieve Razorpay order details for payment verification.",
+    };
+  }
+
+  const orderAmount = Number(fetchedOrder.amount);
+  const amountPaid = Number(fetchedOrder.amount_paid);
+  const currency = String(fetchedOrder.currency || "").trim().toUpperCase();
+
+  if (!Number.isFinite(orderAmount) || orderAmount !== expectedAmountInPaise) {
+    return {
+      ok: false,
+      reason: `Payment amount mismatch: Razorpay order amount (${Number.isFinite(orderAmount) ? orderAmount : "invalid"} paise) does not match server order total (${expectedAmountInPaise} paise).`,
+    };
+  }
+
+  if (currency !== "INR") {
+    return {
+      ok: false,
+      reason: `Payment currency mismatch: expected INR, received "${currency || "unknown"}".`,
+    };
+  }
+
+  if (!Number.isFinite(amountPaid) || amountPaid < orderAmount) {
+    return {
+      ok: false,
+      reason: `Payment incomplete: Razorpay order amount_paid (${Number.isFinite(amountPaid) ? amountPaid : 0} paise) is less than required amount (${orderAmount} paise).`,
+    };
+  }
+
+  return { ok: true };
+}
+
+/**
+ * Sanitizes optional Razorpay order notes from client input and unconditionally
+ * attaches the authenticated user ID so callers cannot spoof ownership in notes.
+ */
+export function sanitizeRazorpayOrderNotes(
+  rawNotes: unknown,
+  authenticatedUserId: string
+): Record<string, string> {
+  const safeNotes: Record<string, string> = {};
+  if (rawNotes && typeof rawNotes === "object" && !Array.isArray(rawNotes)) {
+    let count = 0;
+    for (const [k, v] of Object.entries(rawNotes as Record<string, unknown>)) {
+      if (count >= 10) break;
+      const key = String(k || "").trim().slice(0, 64);
+      if (!key || key === "userId" || key === "user_id") continue;
+      if (typeof v === "string" || typeof v === "number" || typeof v === "boolean") {
+        safeNotes[key] = String(v).trim().slice(0, 256);
+        count++;
+      }
+    }
+  }
+  const cleanUserId = String(authenticatedUserId || "").trim();
+  safeNotes.userId = cleanUserId;
+  safeNotes.user_id = cleanUserId;
+  return safeNotes;
+}
+
+export type WebhookOrderUpdateDecision =
+  | {
+      action: "update";
+      setStatusAccepted: boolean;
+      requirePendingStatus: boolean;
+    }
+  | {
+      action: "skip";
+      reason: string;
+    };
+
+/**
+ * Evaluates whether a verified Razorpay `payment.captured` / `order.paid` webhook
+ * should update a local Supabase order row:
+ * - Compares `paymentEntity.amount` (paise) against `Math.round(order.total_amount * 100)`; skips on mismatch.
+ * - Requires `order.payment_status === "pending"`; skips if already paid/refunded/etc.
+ * - Never modifies `cancelled` or `delivered` orders.
+ * - Only sets `status = "accepted"` when current `order.status === "pending"`.
+ */
+export function evaluateRazorpayWebhookOrderUpdate(params: {
+  existingOrder: {
+    status?: string | null;
+    payment_status?: string | null;
+    total_amount?: number | string | null;
+  } | null | undefined;
+  paymentAmountPaise: unknown;
+}): WebhookOrderUpdateDecision {
+  const { existingOrder, paymentAmountPaise } = params;
+  if (!existingOrder || typeof existingOrder !== "object") {
+    return { action: "skip", reason: "Order not found for razorpay_order_id." };
+  }
+
+  const orderTotalRupees = Number(existingOrder.total_amount);
+  const expectedPaise = Number.isFinite(orderTotalRupees) ? Math.round(orderTotalRupees * 100) : NaN;
+  const actualPaise =
+    typeof paymentAmountPaise === "number" ||
+    (typeof paymentAmountPaise === "string" && paymentAmountPaise.trim() !== "")
+      ? Number(paymentAmountPaise)
+      : NaN;
+
+  if (!Number.isFinite(expectedPaise) || expectedPaise <= 0 || !Number.isFinite(actualPaise)) {
+    return {
+      action: "skip",
+      reason: `Invalid webhook or order amount (paymentEntity.amount=${String(paymentAmountPaise)}, total_amount=${String(existingOrder.total_amount)}).`,
+    };
+  }
+
+  if (actualPaise !== expectedPaise) {
+    return {
+      action: "skip",
+      reason: `Webhook payment amount mismatch: paymentEntity.amount (${actualPaise} paise) does not match order total_amount * 100 (${expectedPaise} paise).`,
+    };
+  }
+
+  const currentPaymentStatus = String(existingOrder.payment_status || "").trim().toLowerCase();
+  if (currentPaymentStatus !== "pending") {
+    return {
+      action: "skip",
+      reason: `Order payment_status is "${currentPaymentStatus || "unknown"}" (not "pending"); skipping update.`,
+    };
+  }
+
+  const currentStatus = String(existingOrder.status || "").trim().toLowerCase();
+  if (currentStatus === "cancelled" || currentStatus === "delivered") {
+    return {
+      action: "skip",
+      reason: `Order status is "${currentStatus}"; terminal orders must never be modified by payment webhooks.`,
+    };
+  }
+
+  const isPendingStatus = currentStatus === "pending";
+  return {
+    action: "update",
+    setStatusAccepted: isPendingStatus,
+    requirePendingStatus: isPendingStatus,
+  };
+}
+
+export type AtomicOtpVerifyOutcome =
+  | { status: 200; verified: true; clearOtp: true; message: string }
+  | { status: 400; verified: false; clearOtp: boolean; error: string }
+  | { status: 429; verified: false; clearOtp: true; error: string };
+
+/**
+ * Decides the HTTP outcome for `/api/auth/verify-email-otp` strictly from the
+ * result of the atomic attempt increment (`attempts` returned by the DB RPC or
+ * synchronous in-memory fallback) and the constant-time hash verification result.
+ */
+export function decideEmailOtpVerificationOutcome(params: {
+  found: boolean;
+  limitReached: boolean;
+  attemptsAfterIncrement: number;
+  maxAttempts: number;
+  isHashValid: boolean;
+}): AtomicOtpVerifyOutcome {
+  if (!params.found) {
+    return {
+      status: 400,
+      verified: false,
+      clearOtp: false,
+      error: "No active verification code found or code expired. Please request a new OTP.",
+    };
+  }
+
+  if (params.limitReached || params.attemptsAfterIncrement > params.maxAttempts) {
+    return {
+      status: 429,
+      verified: false,
+      clearOtp: true,
+      error: "Too many invalid attempts. Please request a new OTP code.",
+    };
+  }
+
+  if (params.isHashValid) {
+    return {
+      status: 200,
+      verified: true,
+      clearOtp: true,
+      message: "Email verification code verified successfully.",
+    };
+  }
+
+  if (params.attemptsAfterIncrement >= params.maxAttempts) {
+    return {
+      status: 429,
+      verified: false,
+      clearOtp: true,
+      error: "Too many invalid attempts. Please request a new OTP code.",
+    };
+  }
+
+  return {
+    status: 400,
+    verified: false,
+    clearOtp: false,
+    error: "Incorrect verification code. Please check the code sent to your email.",
+  };
+}
+
+
+

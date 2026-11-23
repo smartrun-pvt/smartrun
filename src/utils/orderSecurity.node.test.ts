@@ -19,6 +19,11 @@ import {
   isTestRefundPayment,
   isSimulatedRefundAllowed,
   validateNonAdminRefundRequest,
+  normalizeCartItemsForPricing,
+  verifyFetchedRazorpayOrder,
+  sanitizeRazorpayOrderNotes,
+  evaluateRazorpayWebhookOrderUpdate,
+  decideEmailOtpVerificationOutcome,
 } from "./orderSecurity";
 
 test("resolveAuthoritativeOrderItems ignores tampered client prices and uses DB product price", () => {
@@ -549,4 +554,249 @@ test("validateNonAdminRefundRequest enforces order existence, ownership, payment
     assert.equal(validMaster.effectiveAmount, 1650);
   }
 });
+
+test("verifyFetchedRazorpayOrder rejects amount mismatch, non-INR currency, and underpaid orders", () => {
+  // Exact match: 1675 INR = 167500 paise, INR, amount_paid >= amount -> ok
+  assert.deepEqual(
+    verifyFetchedRazorpayOrder({
+      fetchedOrder: {
+        id: "order_RzpValid123",
+        amount: 167500,
+        amount_paid: 167500,
+        currency: "INR",
+        status: "paid",
+      },
+      expectedAmountInPaise: 167500,
+    }),
+    { ok: true }
+  );
+
+  // Amount mismatch (attacker created ₹1 Razorpay order for ₹1675 cart) -> rejected
+  const amountMismatch = verifyFetchedRazorpayOrder({
+    fetchedOrder: {
+      id: "order_RzpCheap1",
+      amount: 100,
+      amount_paid: 100,
+      currency: "INR",
+      status: "paid",
+    },
+    expectedAmountInPaise: 167500,
+  });
+  assert.equal(amountMismatch.ok, false);
+  if (!amountMismatch.ok) {
+    assert.match(amountMismatch.reason, /amount mismatch/i);
+  }
+
+  // Off-by-one paise mismatch -> rejected
+  const offByOne = verifyFetchedRazorpayOrder({
+    fetchedOrder: {
+      amount: 167499,
+      amount_paid: 167499,
+      currency: "INR",
+    },
+    expectedAmountInPaise: 167500,
+  });
+  assert.equal(offByOne.ok, false);
+
+  // Wrong currency (USD instead of INR) -> rejected
+  const wrongCurrency = verifyFetchedRazorpayOrder({
+    fetchedOrder: {
+      amount: 167500,
+      amount_paid: 167500,
+      currency: "USD",
+    },
+    expectedAmountInPaise: 167500,
+  });
+  assert.equal(wrongCurrency.ok, false);
+  if (!wrongCurrency.ok) {
+    assert.match(wrongCurrency.reason, /currency mismatch/i);
+  }
+
+  // Unpaid / partially paid order (amount_paid < amount) -> rejected
+  const underpaid = verifyFetchedRazorpayOrder({
+    fetchedOrder: {
+      amount: 167500,
+      amount_paid: 50000,
+      currency: "INR",
+    },
+    expectedAmountInPaise: 167500,
+  });
+  assert.equal(underpaid.ok, false);
+  if (!underpaid.ok) {
+    assert.match(underpaid.reason, /amount_paid/i);
+  }
+
+  // Null / missing fetched order -> rejected
+  assert.equal(
+    verifyFetchedRazorpayOrder({
+      fetchedOrder: null,
+      expectedAmountInPaise: 167500,
+    }).ok,
+    false
+  );
+});
+
+test("normalizeCartItemsForPricing strips client prices and supports nested and flat item shapes", () => {
+  const normalized = normalizeCartItemsForPricing([
+    {
+      quantity: 2,
+      selectedColor: "Red",
+      product: { id: "prod-1", price: 1, deliveryCharge: 0 },
+    },
+    {
+      productId: "prod-2",
+      quantity: 1,
+      color: "Black",
+      price: 1,
+    },
+  ]);
+
+  assert.equal(normalized.length, 2);
+  assert.deepEqual(normalized[0], {
+    quantity: 2,
+    selectedColor: "Red",
+    product: { id: "prod-1", selectedColor: "Red" },
+  });
+  assert.deepEqual(normalized[1], {
+    quantity: 1,
+    selectedColor: "Black",
+    product: { id: "prod-2", selectedColor: "Black" },
+  });
+  assert.equal((normalized[0].product as any).price, undefined);
+
+  // Invalid quantity or missing id rejects the whole list
+  assert.deepEqual(normalizeCartItemsForPricing([{ quantity: 0, product: { id: "prod-1" } }]), []);
+  assert.deepEqual(normalizeCartItemsForPricing([{ quantity: 1, product: { id: "" } }]), []);
+  assert.deepEqual(normalizeCartItemsForPricing([]), []);
+});
+
+test("sanitizeRazorpayOrderNotes always enforces authenticated userId and prevents spoofing", () => {
+  const notes = sanitizeRazorpayOrderNotes(
+    {
+      userId: "attacker-spoofed-id",
+      user_id: "attacker-spoofed-id",
+      cartType: "electrical",
+      nested: { ignored: true },
+    },
+    "real-auth-user-42"
+  );
+
+  assert.equal(notes.userId, "real-auth-user-42");
+  assert.equal(notes.user_id, "real-auth-user-42");
+  assert.equal(notes.cartType, "electrical");
+  assert.equal((notes as any).nested, undefined);
+});
+
+test("evaluateRazorpayWebhookOrderUpdate guards pending payment_status, preserves terminal orders, and enforces amount match", () => {
+  // Pending payment + pending status + exact amount -> update and set status = accepted
+  assert.deepEqual(
+    evaluateRazorpayWebhookOrderUpdate({
+      existingOrder: { status: "pending", payment_status: "pending", total_amount: 1675 },
+      paymentAmountPaise: 167500,
+    }),
+    { action: "update", setStatusAccepted: true, requirePendingStatus: true }
+  );
+
+  // Pending payment + already packed/accepted status + exact amount -> update payment_status only (keep status)
+  assert.deepEqual(
+    evaluateRazorpayWebhookOrderUpdate({
+      existingOrder: { status: "packed", payment_status: "pending", total_amount: 1675 },
+      paymentAmountPaise: 167500,
+    }),
+    { action: "update", setStatusAccepted: false, requirePendingStatus: false }
+  );
+
+  // Cancelled order must NEVER be changed
+  const cancelled = evaluateRazorpayWebhookOrderUpdate({
+    existingOrder: { status: "cancelled", payment_status: "pending", total_amount: 1675 },
+    paymentAmountPaise: 167500,
+  });
+  assert.equal(cancelled.action, "skip");
+
+  // Delivered order must NEVER be changed
+  const delivered = evaluateRazorpayWebhookOrderUpdate({
+    existingOrder: { status: "delivered", payment_status: "pending", total_amount: 1675 },
+    paymentAmountPaise: 167500,
+  });
+  assert.equal(delivered.action, "skip");
+
+  // Already paid order -> skip
+  const alreadyPaid = evaluateRazorpayWebhookOrderUpdate({
+    existingOrder: { status: "pending", payment_status: "paid", total_amount: 1675 },
+    paymentAmountPaise: 167500,
+  });
+  assert.equal(alreadyPaid.action, "skip");
+
+  // Payment amount mismatch (₹1 vs ₹1675) -> skip
+  const amountDiffers = evaluateRazorpayWebhookOrderUpdate({
+    existingOrder: { status: "pending", payment_status: "pending", total_amount: 1675 },
+    paymentAmountPaise: 100,
+  });
+  assert.equal(amountDiffers.action, "skip");
+  if (amountDiffers.action === "skip") {
+    assert.match(amountDiffers.reason, /amount mismatch/i);
+  }
+});
+
+test("decideEmailOtpVerificationOutcome enforces atomic attempt ceiling strictly", () => {
+  // Missing / expired record -> 400
+  assert.equal(
+    decideEmailOtpVerificationOutcome({
+      found: false,
+      limitReached: false,
+      attemptsAfterIncrement: 0,
+      maxAttempts: 5,
+      isHashValid: false,
+    }).status,
+    400
+  );
+
+  // Valid hash on attempt 5 (within ceiling) -> 200 & clearOtp
+  const fifthValid = decideEmailOtpVerificationOutcome({
+    found: true,
+    limitReached: false,
+    attemptsAfterIncrement: 5,
+    maxAttempts: 5,
+    isHashValid: true,
+  });
+  assert.equal(fifthValid.status, 200);
+  assert.equal(fifthValid.verified, true);
+  assert.equal(fifthValid.clearOtp, true);
+
+  // Invalid hash on attempt 4 (< 5) -> 400 & do NOT clear yet
+  const fourthInvalid = decideEmailOtpVerificationOutcome({
+    found: true,
+    limitReached: false,
+    attemptsAfterIncrement: 4,
+    maxAttempts: 5,
+    isHashValid: false,
+  });
+  assert.equal(fourthInvalid.status, 400);
+  assert.equal(fourthInvalid.clearOtp, false);
+
+  // Invalid hash on attempt 5 (== 5) -> 429 & clearOtp
+  const fifthInvalid = decideEmailOtpVerificationOutcome({
+    found: true,
+    limitReached: false,
+    attemptsAfterIncrement: 5,
+    maxAttempts: 5,
+    isHashValid: false,
+  });
+  assert.equal(fifthInvalid.status, 429);
+  assert.equal(fifthInvalid.clearOtp, true);
+
+  // Atomic RPC returned limit_reached = true (6th+ concurrent attempt) -> 429 even if hash were valid
+  const overLimit = decideEmailOtpVerificationOutcome({
+    found: true,
+    limitReached: true,
+    attemptsAfterIncrement: 5,
+    maxAttempts: 5,
+    isHashValid: true,
+  });
+  assert.equal(overLimit.status, 429);
+  assert.equal(overLimit.verified, false);
+  assert.equal(overLimit.clearOtp, true);
+});
+
+
 
