@@ -15,7 +15,11 @@ import { KolkataArea, SavedAddress } from '../types';
 import { KOLKATA_AREAS } from '../data/kolkataAreas';
 import { ACTIVE_SAVED_ADDRESS_KEY, getActiveAddressStorageKey, safeSetItem, safeRemoveItem } from '../services/supabaseService';
 import { useBottomSheetDismiss } from '../hooks/useBottomSheetDismiss';
-import { getResilientCurrentPosition, reverseGeocodeWithFallback } from '../utils/geolocationHelper';
+import {
+  getResilientCurrentPosition,
+  resolveAreaFromCoordinates,
+  reverseGeocodeWithFallback
+} from '../utils/geolocationHelper';
 import { showToast } from '../utils/toast';
 
 interface DeviceLocationPromptModalProps {
@@ -57,22 +61,28 @@ export const DeviceLocationPromptModal = ({
     setGpsError(null);
 
     try {
-      // Multi-tier resilient positioning: tries GPS, then Network/Cell, then temporary watch listener
+      // Multi-tier resilient positioning: triggers Android/browser runtime permission ONLY on Enable tap
       const pos = await getResilientCurrentPosition();
       const lat = pos.lat;
       const lng = pos.lng;
 
-      // Safe reverse geocoding with fast fallback
-      const { street, matchedArea } = await reverseGeocodeWithFallback(lat, lng, 3500);
+      // Safe reverse geocoding: primary Google Maps provider with Nominatim fallback
+      let street = '';
+      let pincode = '';
+      try {
+        const { mapManager } = await import('../services/maps');
+        const revRes = await mapManager.reverseGeocode({ lat, lng });
+        street = revRes.street || revRes.formattedAddress || '';
+        pincode = revRes.pincode && /^\d{6}$/.test(revRes.pincode) ? revRes.pincode : '';
+      } catch {
+        const fallback = await reverseGeocodeWithFallback(lat, lng, 3500);
+        street = fallback.street;
+        pincode = fallback.pincode || '';
+      }
+
+      const appliedArea: KolkataArea = resolveAreaFromCoordinates(lat, lng, street, pincode);
 
       setGpsLoading(false);
-
-      const appliedArea: KolkataArea = {
-        ...matchedArea,
-        lat,
-        lng,
-        exactStreet: street
-      };
 
       try {
         safeRemoveItem(getActiveAddressStorageKey());
@@ -81,7 +91,7 @@ export const DeviceLocationPromptModal = ({
         console.error(e);
       }
 
-      showToast(`Location detected: ${street}`, 'success');
+      showToast(`Location detected: ${appliedArea.exactStreet || appliedArea.name}`, 'success');
       onSelectArea(appliedArea, undefined);
       onClose();
     } catch (err: any) {
@@ -157,7 +167,7 @@ export const DeviceLocationPromptModal = ({
       <button
         type="button"
         onClick={onClose}
-        className="mb-2.5 sm:mb-3 w-9 h-9 sm:w-10 sm:h-10 rounded-full bg-slate-900/90 hover:bg-slate-950 text-white shadow-xl flex items-center justify-center transition-transform hover:scale-105 active:scale-95 cursor-pointer border border-white/20"
+        className="mb-3 w-10 h-10 rounded-full bg-[#1e293b]/95 hover:bg-slate-950 text-white shadow-xl flex items-center justify-center transition-transform hover:scale-105 active:scale-95 cursor-pointer border border-white/15"
         title="Close"
         aria-label="Close location prompt"
       >
@@ -171,34 +181,34 @@ export const DeviceLocationPromptModal = ({
         aria-modal="true"
         aria-label="Choose delivery location"
         style={dragStyle}
-        className="w-full max-w-lg bg-[#f8fafc] rounded-t-3xl sm:rounded-3xl shadow-2xl overflow-hidden border border-slate-200/90 animate-in slide-in-from-bottom duration-300 flex flex-col max-h-[85vh] sm:max-h-[80vh] text-slate-900"
+        className="w-full max-w-lg bg-white rounded-t-[28px] sm:rounded-3xl shadow-2xl overflow-hidden border border-slate-200/80 animate-in slide-in-from-bottom duration-300 flex flex-col max-h-[85vh] sm:max-h-[80vh] text-slate-900"
       >
         {/* Drag Down Handle on Mobile */}
         <div
           onTouchStart={handleSheetTouchStart}
           onTouchMove={handleSheetTouchMove}
           onTouchEnd={handleSheetTouchEnd}
-          className="w-full flex flex-col items-center justify-center pt-2.5 pb-1.5 sm:hidden cursor-grab active:cursor-grabbing touch-none select-none"
+          className="w-full flex flex-col items-center justify-center pt-3 pb-1.5 sm:hidden cursor-grab active:cursor-grabbing touch-none select-none"
         >
-          <div className="w-12 h-1.5 bg-slate-300 rounded-full hover:bg-slate-400 transition-colors" />
+          <div className="w-12 h-1.5 bg-slate-200 rounded-full hover:bg-slate-300 transition-colors" />
         </div>
 
-        <div className="p-3.5 sm:p-5 space-y-3 sm:space-y-3.5 overflow-y-auto no-scrollbar pb-6 sm:pb-5">
-          
-          {/* Card 1: Current Location with Pink/Red Pin & Enable Button */}
-          <div className="bg-white rounded-2xl p-3 sm:p-3.5 border border-slate-200/90 shadow-2xs flex items-center justify-between gap-3">
+        <div className="p-4 sm:p-5 space-y-3 sm:space-y-3.5 overflow-y-auto no-scrollbar pb-6 sm:pb-5">
+
+          {/* Card 1: Current Location with Soft Pink Pin Circle & Enable Pill Button */}
+          <div className="bg-white rounded-2xl px-3.5 py-3.5 border border-slate-200/80 shadow-[0_1px_4px_rgba(15,23,42,0.04)] flex items-center justify-between gap-3">
             <div className="flex items-center gap-3 min-w-0">
-              {/* Google Maps Style Reddish Pin */}
-              <div className="relative flex items-center justify-center w-10 h-10 sm:w-11 sm:h-11 rounded-2xl bg-rose-50 border border-rose-100 flex-shrink-0">
+              {/* Soft Pink Circular Location Pin */}
+              <div className="relative flex items-center justify-center w-10 h-10 sm:w-11 sm:h-11 rounded-full bg-rose-50 border border-rose-100/80 flex-shrink-0">
                 <svg
-                  className="w-5.5 h-5.5 sm:w-6 sm:h-6"
+                  className="w-5 h-5 sm:w-5.5 sm:h-5.5"
                   viewBox="0 0 24 24"
                   fill="none"
                   xmlns="http://www.w3.org/2000/svg"
                 >
                   <path
                     d="M12 2C8.13401 2 5 5.13401 5 9C5 14.18 11.16 21.32 11.45 21.65C11.74 21.98 12.26 21.98 12.55 21.65C12.84 21.32 19 14.18 19 9C19 5.13401 15.866 2 12 2Z"
-                    fill="#e23744"
+                    fill="#f43f5e"
                   />
                   <ellipse
                     cx="12"
@@ -211,19 +221,19 @@ export const DeviceLocationPromptModal = ({
               </div>
 
               <div className="min-w-0">
-                <h3 className="text-sm sm:text-base font-black text-slate-900 tracking-tight leading-none truncate">
+                <h3 className="text-[15px] sm:text-base font-black text-slate-900 tracking-tight leading-none truncate">
                   Current location
                 </h3>
               </div>
             </div>
 
-            {/* Enable Action Button */}
+            {/* Enable Action Pill Button */}
             <button
               type="button"
               id="enable-device-location-btn"
               onClick={handleEnableLocation}
               disabled={gpsLoading}
-              className="px-4 sm:px-5 py-2 sm:py-2.5 rounded-2xl bg-gradient-to-r from-[#e23744] via-[#ef4444] to-[#f43f5e] hover:brightness-105 active:scale-95 text-white font-bold text-xs sm:text-sm tracking-tight shadow-md shadow-rose-500/25 transition-all cursor-pointer shrink-0 disabled:opacity-75 flex items-center gap-1.5 min-h-[38px]"
+              className="px-5 py-2 rounded-full bg-gradient-to-r from-[#ff244f] via-[#f43f5e] to-[#ff3b5c] hover:brightness-105 active:scale-95 text-white font-bold text-xs sm:text-sm tracking-tight shadow-[0_6px_16px_-4px_rgba(244,63,94,0.55)] transition-all cursor-pointer shrink-0 disabled:opacity-75 flex items-center gap-1.5 min-h-[38px]"
             >
               {gpsLoading ? (
                 <>
@@ -244,17 +254,17 @@ export const DeviceLocationPromptModal = ({
               onClose();
               onOpenManualSearch();
             }}
-            className="w-full bg-white border border-slate-200/90 hover:border-slate-300 rounded-2xl p-3 sm:p-3.5 transition-all shadow-2xs hover:shadow-xs flex items-center justify-between text-left cursor-pointer group min-h-[46px]"
+            className="w-full bg-white border border-slate-200/80 hover:border-slate-300 rounded-2xl px-3.5 py-3 transition-all shadow-[0_1px_4px_rgba(15,23,42,0.04)] hover:shadow-xs flex items-center justify-between text-left cursor-pointer group min-h-[54px]"
           >
-            <div className="flex items-center gap-2.5 sm:gap-3 min-w-0">
-              <div className="w-9 h-9 sm:w-10 sm:h-10 rounded-xl bg-rose-50 border border-rose-100 text-[#e23744] flex items-center justify-center shrink-0">
-                <Search className="w-4 h-4 stroke-[2.5]" />
+            <div className="flex items-center gap-3 min-w-0">
+              <div className="w-10 h-10 rounded-full bg-rose-50 border border-rose-100/80 text-[#f43f5e] flex items-center justify-center shrink-0">
+                <Search className="w-4.5 h-4.5 stroke-[2.25]" />
               </div>
-              <span className="text-xs sm:text-sm font-semibold text-slate-800 group-hover:text-slate-950 truncate">
+              <span className="text-sm font-medium text-slate-800 group-hover:text-slate-950 truncate">
                 Search location manually
               </span>
             </div>
-            <ChevronRight className="w-4 h-4 text-slate-400 group-hover:text-slate-700 group-hover:translate-x-0.5 transition-transform shrink-0" />
+            <ChevronRight className="w-4.5 h-4.5 text-slate-400 group-hover:text-slate-700 group-hover:translate-x-0.5 transition-transform shrink-0" />
           </button>
 
           {/* GPS Error message if permission denied or timed out */}
@@ -285,11 +295,11 @@ export const DeviceLocationPromptModal = ({
             </div>
           )}
 
-          {/* Card 3: Saved Addresses (If available) */}
+          {/* Card 3: Saved Addresses (Shown when logged in and saved addresses exist) */}
           {savedAddresses && savedAddresses.length > 0 && (
-            <div className="space-y-1.5 pt-1">
-              <div className="flex items-center justify-between px-1 mb-1">
-                <h4 className="text-xs font-bold text-slate-600 uppercase tracking-wider">
+            <div className="space-y-2 pt-1">
+              <div className="flex items-center justify-between px-1">
+                <h4 className="text-[11px] font-bold text-slate-500 uppercase tracking-wider">
                   Saved Addresses
                 </h4>
                 <button
@@ -298,28 +308,33 @@ export const DeviceLocationPromptModal = ({
                     onClose();
                     onOpenManualSearch();
                   }}
-                  className="text-[11px] sm:text-xs font-bold text-[#e23744] hover:text-[#d02836] transition-colors cursor-pointer"
+                  className="text-xs font-bold text-[#f43f5e] hover:text-[#e11d48] transition-colors cursor-pointer"
                 >
                   Manage ({savedAddresses.length})
                 </button>
               </div>
 
-              <div className="bg-white rounded-2xl p-1 shadow-2xs divide-y divide-slate-100 max-h-[180px] overflow-y-auto no-scrollbar border border-slate-100">
+              <div className="bg-white rounded-2xl p-1.5 shadow-[0_1px_4px_rgba(15,23,42,0.04)] divide-y divide-slate-100 max-h-[210px] overflow-y-auto no-scrollbar border border-slate-200/80">
                 {savedAddresses.map((addr) => {
                   const isSelected = activeAddress?.id === addr.id;
-                  const shortAddress = addr.buildingRoad || addr.area?.name || addr.houseName || 'Kolkata';
+                  const shortAddress =
+                    [addr.houseName, addr.buildingRoad, addr.area?.name]
+                      .map((part) => (part || '').trim())
+                      .filter(Boolean)
+                      .join(', ') || 'Kolkata';
                   return (
-                    <div
+                    <button
+                      type="button"
                       key={addr.id}
                       onClick={() => handleSelectAddress(addr)}
                       className={`w-full p-2.5 sm:p-3 rounded-xl transition-all cursor-pointer flex items-center justify-between gap-3 text-left group ${
                         isSelected
-                          ? 'bg-slate-100/90 font-medium'
+                          ? 'bg-rose-50/70 font-medium'
                           : 'hover:bg-slate-50'
                       }`}
                     >
-                      <div className="flex items-center gap-2.5 overflow-hidden min-w-0">
-                        <div className="w-7 h-7 sm:w-8 sm:h-8 rounded-lg bg-slate-100 text-slate-700 flex items-center justify-center shrink-0">
+                      <div className="flex items-center gap-3 overflow-hidden min-w-0">
+                        <div className="w-9 h-9 rounded-full bg-rose-50 border border-rose-100/80 flex items-center justify-center shrink-0">
                           {getTagIcon(addr.tag)}
                         </div>
                         <div className="overflow-hidden min-w-0">
@@ -328,7 +343,7 @@ export const DeviceLocationPromptModal = ({
                               {getTagTitle(addr)}
                             </span>
                           </div>
-                          <p className="text-[11px] text-slate-500 truncate">
+                          <p className="text-[11px] sm:text-xs text-slate-500 truncate">
                             {shortAddress}
                           </p>
                         </div>
@@ -336,14 +351,14 @@ export const DeviceLocationPromptModal = ({
 
                       <div className="flex items-center gap-1.5 shrink-0">
                         {isSelected ? (
-                          <div className="w-5 h-5 rounded-full bg-slate-900 text-white flex items-center justify-center shadow-xs">
+                          <div className="w-5 h-5 rounded-full bg-[#f43f5e] text-white flex items-center justify-center shadow-xs">
                             <Check className="w-3 h-3 stroke-[3]" />
                           </div>
                         ) : (
                           <ChevronRight className="w-4 h-4 text-slate-400 group-hover:text-slate-900 group-hover:translate-x-0.5 transition-transform" />
                         )}
                       </div>
-                    </div>
+                    </button>
                   );
                 })}
               </div>

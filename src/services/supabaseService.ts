@@ -3717,7 +3717,7 @@ export async function fetchUserAddresses(): Promise<SavedAddress[]> {
     const savedProf = scope ? getSavedUserProfile(scope) : getSavedUserProfile();
     const userPhone = authUser?.phone || savedProf?.phone || '';
     const userEmail = authUser?.email || savedProf?.email || '';
-    const userId = authUser?.id || '';
+    const userId = authUser?.id || savedProf?.id || '';
 
     const ADMIN_EMAILS = ['gauravgiri123344@gmail.com', 'mdhassan1738@gmail.com'];
     const isUserAdmin = Boolean(userEmail && ADMIN_EMAILS.includes(userEmail.toLowerCase()));
@@ -3854,6 +3854,15 @@ export async function fetchUserAddresses(): Promise<SavedAddress[]> {
         inMemoryAddresses.set(scope, list);
         inMemoryActiveAddress.set(scope, list[0]);
       }
+      notifyAddressListeners(list);
+      return list;
+    }
+
+    // Never wipe locally cached saved addresses when Supabase auth has not hydrated or server returned empty offline
+    const localCached = scope ? getStoredAddresses(scope) : [];
+    if (!authUser?.id && localCached.length > 0) {
+      notifyAddressListeners(localCached);
+      return localCached;
     }
 
     notifyAddressListeners(list);

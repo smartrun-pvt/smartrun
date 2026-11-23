@@ -4,7 +4,14 @@ import { Routes, Route, useNavigate, useLocation, Navigate } from 'react-router-
 import { MotionConfig } from 'motion/react';
 import { Product, CartItem, KolkataArea, SavedAddress, Order, WiringServiceBooking, UserProfile } from './types';
 import { KOLKATA_AREAS, getKolkataAreaByPincode, isKolkataServiceable } from './data/kolkataAreas';
-import { getResilientCurrentPosition, reverseGeocodeWithFallback } from './utils/geolocationHelper';
+import {
+  checkLocationPermissionStatus,
+  decideStartupLocationAction,
+  getResilientCurrentPosition,
+  isLocationPromptSuppressedRoute,
+  resolveAreaFromCoordinates,
+  reverseGeocodeWithFallback
+} from './utils/geolocationHelper';
 import { Header } from './components/Header';
 import { HomePage } from './components/HomePage';
 import { FloatingBottomNav } from './components/FloatingBottomNav';
@@ -28,7 +35,7 @@ const ConstructionPage = lazyWithRetry(() => import('./components/ConstructionPa
 const TechniciansPage = lazyWithRetry(() => import('./components/technicians/TechniciansPage').then((m) => ({ default: m.TechniciansPage })));
 const TechnicianDetailPage = lazyWithRetry(() => import('./components/technicians/TechnicianDetailPage').then((m) => ({ default: m.TechnicianDetailPage })));
 const InstallAppModal = lazyWithRetry(() => import('./components/InstallAppModal').then((m) => ({ default: m.InstallAppModal })));
-const DeviceLocationPromptModal = lazyWithRetry(() => import('./components/DeviceLocationPromptModal').then((m) => ({ default: m.DeviceLocationPromptModal })));
+import { DeviceLocationPromptModal } from './components/DeviceLocationPromptModal';
 const AddProductModal = lazyWithRetry(() => import('./components/AddProductModal').then((m) => ({ default: m.AddProductModal })));
 const LiveOrderDetailsModal = lazyWithRetry(() => import('./components/orders/LiveOrderDetailsModal').then((m) => ({ default: m.LiveOrderDetailsModal })));
 const LiveOrderPage = lazyWithRetry(() => import('./components/orders/LiveOrderPage').then((m) => ({ default: m.LiveOrderPage })));
@@ -165,43 +172,65 @@ export default function App() {
   });
 
   const [isLocationFetching, setIsLocationFetching] = useState(false);
+  const hasHandledStartupLocationRef = useRef(false);
 
-  // Automatic non-intrusive location fetch when permission is already granted (prevents geolocation-on-start prompts and backdrop obstruction)
+  // Startup location permission check:
+  // - Never triggers Android/browser OS location permission automatically on launch.
+  // - If location permission is NOT granted, shows DeviceLocationPromptModal (with Saved Addresses if logged in).
+  // - Android/browser permission dialog is ONLY triggered when user taps "Enable" inside the modal.
+  // - If permission is already granted and no saved address is pinned, silently fetches current location.
   useEffect(() => {
+    if (hasHandledStartupLocationRef.current) return;
+    if (isLocationPromptSuppressedRoute(location.pathname)) return;
+
     let isCancelled = false;
 
-    const fetchCurrentLocationOnLaunch = async () => {
-      // If user already has an explicit custom saved address (e.g. Home/Work), don't override their specific house choice
-      const storedAddr = safeGetItem(getActiveAddressStorageKey()) || safeGetItem(ACTIVE_SAVED_ADDRESS_KEY);
+    const runStartupLocationCheck = async () => {
+      if (isCancelled || hasHandledStartupLocationRef.current) return;
+
+      let isPromptDismissedInSession = false;
+      try {
+        isPromptDismissedInSession =
+          sessionStorage.getItem('smartrun_location_prompt_dismissed') === 'true';
+      } catch {}
+
+      let hasActiveSavedAddress = false;
+      const storedAddr =
+        safeGetItem(getActiveAddressStorageKey()) || safeGetItem(ACTIVE_SAVED_ADDRESS_KEY);
       if (storedAddr) {
         try {
           const parsed = JSON.parse(storedAddr);
-          if (parsed && (parsed.houseFlat || parsed.houseName)) {
-            return;
+          if (parsed && (parsed.houseFlat || parsed.houseName || parsed.buildingRoad || parsed.id)) {
+            hasActiveSavedAddress = true;
           }
         } catch {}
       }
 
-      // On web browsers, only auto-fetch GPS on load when geolocation permission is already granted
-      if (!Capacitor.isNativePlatform() && !isNativePhoneApp()) {
-        try {
-          if (typeof navigator !== 'undefined' && navigator.permissions?.query) {
-            const perm = await navigator.permissions.query({ name: 'geolocation' as PermissionName });
-            if (perm.state !== 'granted') {
-              return;
-            }
-          } else {
-            return;
-          }
-        } catch {
-          return;
-        }
+      // Strictly read-only permission check (never triggers OS permission popup)
+      const permissionStatus = await checkLocationPermissionStatus();
+      if (isCancelled || hasHandledStartupLocationRef.current) return;
+      hasHandledStartupLocationRef.current = true;
+
+      const action = decideStartupLocationAction({
+        permissionStatus,
+        isPromptDismissedInSession,
+        hasActiveSavedAddress,
+        isSuppressedRoute: isLocationPromptSuppressedRoute(location.pathname)
+      });
+
+      if (action === 'show_prompt') {
+        setIsDeviceLocationPromptOpen(true);
+        return;
+      }
+
+      if (action !== 'fetch_current') {
+        return;
       }
 
       try {
         setIsLocationFetching(true);
 
-        // Fetch user device GPS / network position
+        // Safe here: permissionStatus === 'granted' was already confirmed above
         const coords = await getResilientCurrentPosition();
         if (isCancelled) return;
 
@@ -221,35 +250,7 @@ export default function App() {
 
         if (isCancelled) return;
 
-        // Match closest Kolkata delivery area
-        const distKm = Math.hypot(coords.lat - 22.5726, coords.lng - 88.3639) * 111;
-        let closest = KOLKATA_AREAS[0];
-        let minDistance = Number.MAX_VALUE;
-        KOLKATA_AREAS.forEach((a) => {
-          if (a.lat && a.lng) {
-            const dist = Math.hypot(a.lat - coords.lat, a.lng - coords.lng);
-            if (dist < minDistance) {
-              minDistance = dist;
-              closest = a;
-            }
-          }
-        });
-
-        const isOutsideKolkata = distKm > 35 || (pincode ? !isKolkataServiceable(pincode) : false);
-        const resolvedPin = pincode || (isOutsideKolkata ? '000000' : closest.pincode);
-        const areaForPin = pincode ? getKolkataAreaByPincode(pincode) : null;
-        const baseArea = areaForPin || closest;
-
-        const resolvedStreet = street || baseArea.exactStreet || baseArea.name;
-        const detectedArea: KolkataArea = {
-          ...baseArea,
-          pincode: resolvedPin,
-          serviceable: !isOutsideKolkata && isKolkataServiceable(resolvedPin),
-          name: isOutsideKolkata ? (street || 'Outside Delivery Area') : (areaForPin ? areaForPin.name : resolvedStreet),
-          exactStreet: resolvedStreet,
-          lat: coords.lat,
-          lng: coords.lng
-        };
+        const detectedArea = resolveAreaFromCoordinates(coords.lat, coords.lng, street, pincode);
 
         setCurrentArea(detectedArea);
         safeSetItem('smartrun_selected_area', JSON.stringify(detectedArea));
@@ -265,12 +266,12 @@ export default function App() {
       }
     };
 
-    const timer = setTimeout(fetchCurrentLocationOnLaunch, 400);
+    const timer = setTimeout(runStartupLocationCheck, 450);
     return () => {
       isCancelled = true;
       clearTimeout(timer);
     };
-  }, []);
+  }, [location.pathname]);
 
   const getActiveTabFromLocation = (): 'home' | 'catalog' | 'orders' | 'profile' | 'cart' | 'privacy' | 'terms' | 'electrical' | 'construction' | 'technicians' => {
     const path = location.pathname.toLowerCase();
@@ -2415,7 +2416,7 @@ export default function App() {
         )}
 
         {isDeviceLocationPromptOpen &&
-          !/^\/(login|auth|reset-password|personal-info|about|about-us|app|download|delivery-areas|service-areas|contact|contact-us|support|faq|faqs|shipping|shipping-policy|shipping-and-return-policy|return|return-policy|returns|refund|refund-policy|refunds|privacy|privacy-policy|terms|terms-of-service|sitemap|how-to-use|guide|delete|account-deletion)\b/i.test(location.pathname) && (
+          !isLocationPromptSuppressedRoute(location.pathname) && (
           <DeviceLocationPromptModal
             isOpen={isDeviceLocationPromptOpen}
             onClose={() => {
@@ -2424,7 +2425,7 @@ export default function App() {
                 sessionStorage.setItem('smartrun_location_prompt_dismissed', 'true');
               } catch {}
             }}
-            savedAddresses={savedAddresses}
+            savedAddresses={isAuthenticated ? savedAddresses : []}
             currentArea={currentArea}
             activeAddress={activeSavedAddress}
             onSelectArea={(area, addr) => {
@@ -2434,6 +2435,7 @@ export default function App() {
                 if (area?.pincode) {
                   safeSetItem('smartrun_user_pincode', area.pincode);
                 }
+                sessionStorage.setItem('smartrun_location_prompt_dismissed', 'true');
               } catch (e) {}
               if (addr) {
                 setActiveSavedAddress(addr);
@@ -2443,6 +2445,9 @@ export default function App() {
               setIsDeviceLocationPromptOpen(false);
             }}
             onOpenManualSearch={() => {
+              try {
+                sessionStorage.setItem('smartrun_location_prompt_dismissed', 'true');
+              } catch {}
               setIsDeviceLocationPromptOpen(false);
               setIsLocationModalOpen(true);
             }}

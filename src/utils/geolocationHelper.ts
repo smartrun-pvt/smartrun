@@ -1,5 +1,5 @@
 import { KolkataArea } from '../types';
-import { KOLKATA_AREAS } from '../data/kolkataAreas';
+import { KOLKATA_AREAS, getKolkataAreaByPincode, isKolkataServiceable } from '../data/kolkataAreas';
 import { Capacitor } from '@capacitor/core';
 import { Geolocation } from '@capacitor/geolocation';
 
@@ -20,6 +20,138 @@ export interface GeolocationResult {
   matchedArea: KolkataArea;
   error?: string;
   isPermissionDenied?: boolean;
+}
+
+export type LocationPermissionStatus = 'granted' | 'prompt' | 'denied' | 'unsupported';
+export type StartupLocationAction = 'fetch_current' | 'show_prompt' | 'none';
+
+export interface StartupLocationDecisionInput {
+  permissionStatus: LocationPermissionStatus;
+  isPromptDismissedInSession: boolean;
+  hasActiveSavedAddress: boolean;
+  isSuppressedRoute: boolean;
+}
+
+const LOCATION_PROMPT_SUPPRESSED_ROUTE_REGEX =
+  /^\/(login|auth|reset-password|personal-info|about|about-us|app|download|delivery-areas|service-areas|contact|contact-us|support|faq|faqs|shipping|shipping-policy|shipping-and-return-policy|return|return-policy|returns|refund|refund-policy|refunds|privacy|privacy-policy|terms|terms-of-service|sitemap|how-to-use|guide|delete|account-deletion)\b/i;
+
+/**
+ * Returns true on auth, legal, or standalone info routes where the startup
+ * location bottom sheet should stay hidden.
+ */
+export function isLocationPromptSuppressedRoute(pathname: string): boolean {
+  if (!pathname) return false;
+  return LOCATION_PROMPT_SUPPRESSED_ROUTE_REGEX.test(pathname);
+}
+
+/**
+ * Pure startup decision engine:
+ * - Never triggers GPS or native OS permission prompts if permission is not already granted.
+ * - Shows DeviceLocationPromptModal on launch when location permission has not been granted.
+ * - Silently fetches GPS only when permission is already granted and no saved address is pinned.
+ */
+export function decideStartupLocationAction(
+  input: StartupLocationDecisionInput
+): StartupLocationAction {
+  const {
+    permissionStatus,
+    isPromptDismissedInSession,
+    hasActiveSavedAddress,
+    isSuppressedRoute
+  } = input;
+
+  if (permissionStatus === 'granted') {
+    return hasActiveSavedAddress ? 'none' : 'fetch_current';
+  }
+
+  if (isPromptDismissedInSession || isSuppressedRoute) {
+    return 'none';
+  }
+
+  return 'show_prompt';
+}
+
+/**
+ * Read-only permission check that NEVER triggers a browser or Android OS permission dialog.
+ */
+export async function checkLocationPermissionStatus(): Promise<LocationPermissionStatus> {
+  const withTimeout = <T,>(promise: Promise<T>, fallback: T, ms = 1500): Promise<T> =>
+    Promise.race([
+      promise,
+      new Promise<T>((resolve) => setTimeout(() => resolve(fallback), ms))
+    ]);
+
+  if (Capacitor.isNativePlatform()) {
+    try {
+      const perm = await withTimeout(Geolocation.checkPermissions(), null as any, 1500);
+      if (!perm) return 'prompt';
+      if (perm.location === 'granted' || perm.coarseLocation === 'granted') {
+        return 'granted';
+      }
+      if (perm.location === 'denied' && perm.coarseLocation === 'denied') {
+        return 'denied';
+      }
+      return 'prompt';
+    } catch {
+      return 'prompt';
+    }
+  }
+
+  if (typeof navigator === 'undefined' || !navigator.geolocation) {
+    return 'unsupported';
+  }
+
+  try {
+    if (navigator.permissions?.query) {
+      const perm = await withTimeout(
+        navigator.permissions.query({ name: 'geolocation' as PermissionName }),
+        null as any,
+        1500
+      );
+      if (perm && (perm.state === 'granted' || perm.state === 'prompt' || perm.state === 'denied')) {
+        return perm.state;
+      }
+    }
+  } catch {
+    // Safari / older WebViews may not support navigator.permissions.query('geolocation')
+  }
+
+  return 'prompt';
+}
+
+/**
+ * Resolves a KolkataArea object (including outside-Kolkata serviceability status)
+ * from raw latitude/longitude plus optional reverse-geocoded street & pincode.
+ */
+export function resolveAreaFromCoordinates(
+  lat: number,
+  lng: number,
+  street?: string,
+  pincode?: string
+): KolkataArea {
+  const cleanPincode = pincode && /^\d{6}$/.test(pincode) ? pincode : '';
+  const distKm = Math.hypot(lat - 22.5726, lng - 88.3639) * 111;
+  const closest = findNearestKolkataArea(lat, lng, cleanPincode || undefined);
+
+  const isOutsideKolkata = distKm > 35 || (cleanPincode ? !isKolkataServiceable(cleanPincode) : false);
+  const resolvedPin = cleanPincode || (isOutsideKolkata ? '000000' : closest.pincode);
+  const areaForPin = cleanPincode ? getKolkataAreaByPincode(cleanPincode) : undefined;
+  const baseArea = areaForPin || closest;
+
+  const resolvedStreet = (street || '').trim() || baseArea.exactStreet || baseArea.name;
+  return {
+    ...baseArea,
+    pincode: resolvedPin,
+    serviceable: !isOutsideKolkata && isKolkataServiceable(resolvedPin),
+    name: isOutsideKolkata
+      ? (street || '').trim() || 'Outside Delivery Area'
+      : areaForPin
+      ? areaForPin.name
+      : resolvedStreet,
+    exactStreet: resolvedStreet,
+    lat,
+    lng
+  };
 }
 
 /**
@@ -168,11 +300,11 @@ export async function getResilientCurrentPosition(): Promise<ResilientPosition> 
     try {
       // Check & request runtime permissions on Android
       let perm = await Geolocation.checkPermissions();
-      if (perm.location !== 'granted') {
+      if (perm.location !== 'granted' && perm.coarseLocation !== 'granted') {
         perm = await Geolocation.requestPermissions();
       }
 
-      if (perm.location === 'denied') {
+      if (perm.location !== 'granted' && perm.coarseLocation !== 'granted') {
         const error = new Error('Location permission was denied. Please allow location access in your Android app settings.');
         (error as any).code = 1;
         throw error;
