@@ -1513,17 +1513,24 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
   }
 
   return (
-    <div className="min-h-[100dvh] bg-white flex flex-col justify-end items-center px-4 pt-10 pb-4 sm:pt-16 sm:pb-8 relative overflow-x-hidden overflow-y-auto overscroll-contain">
+    <div className="min-h-[100dvh] bg-white flex flex-col justify-end items-center px-4 pt-[calc(var(--safe-area-top,env(safe-area-inset-top,0px))+4.5rem)] pb-4 sm:pt-[calc(var(--safe-area-top,env(safe-area-inset-top,0px))+5rem)] sm:pb-8 relative overflow-x-hidden overflow-y-auto overscroll-contain">
       <SEOHead
         title="Sign In / Register | SmartRun Express Electricals"
         description="Sign in to your SmartRun account with mobile OTP, email, or Google to track express delivery orders, manage addresses, and access wholesale pricing."
         keywords="smartrun login, smartrun signup, electrical depot account, mobile otp login"
       />
 
-      {/* Top Back Navigation Arrow Button */}
-      <div className="absolute top-4 left-4 sm:top-6 sm:left-6 z-20">
+      {/* Fixed Top Back Navigation Button - Positioned safely below Android status bar & clock/battery */}
+      <div
+        className={`fixed left-4 sm:left-6 z-30 ${
+          isNativeApp
+            ? 'top-[calc(max(var(--safe-area-top,env(safe-area-inset-top,0px)),28px)+0.875rem)]'
+            : 'top-[calc(var(--safe-area-top,env(safe-area-inset-top,0px))+1.25rem)] sm:top-[calc(var(--safe-area-top,env(safe-area-inset-top,0px))+1.5rem)]'
+        }`}
+      >
         <button
           type="button"
+          id="login-back-store-btn"
           onClick={() => {
             if (authStep !== 'primary') {
               setAuthStep('primary');
@@ -1534,10 +1541,10 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
               navigate('/', { replace: true });
             }
           }}
-          className="p-1.5 text-slate-700 hover:text-black hover:bg-slate-100 rounded-full transition-colors cursor-pointer flex items-center gap-1 active:scale-95 text-xs font-bold touch-manipulation"
+          className="group px-3 py-1.5 bg-white/90 backdrop-blur-md border border-slate-200/80 shadow-[0_2px_10px_-3px_rgba(15,23,42,0.12)] text-slate-700 hover:text-slate-950 hover:bg-slate-50 hover:border-slate-300/90 hover:shadow-[0_6px_16px_-6px_rgba(15,23,42,0.16)] rounded-full transition-[transform,background-color,border-color,color,box-shadow] duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] cursor-pointer flex items-center gap-1.5 hover:-translate-x-0.5 active:scale-[0.94] active:translate-x-0 text-xs font-bold touch-manipulation will-change-transform"
           title={authStep !== 'primary' ? 'Back' : 'Back to Store'}
         >
-          <ArrowLeft className="w-4 h-4 stroke-[2.5]" />
+          <ArrowLeft className="w-4 h-4 stroke-[2.5] transition-transform duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] group-hover:-translate-x-0.5" />
           <span>{authStep !== 'primary' ? 'Back' : 'Store'}</span>
         </button>
       </div>
@@ -1766,7 +1773,7 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
                           setOtpCode('');
                           resetMessages();
                         }}
-                        className="text-xs font-semibold text-slate-500 hover:text-slate-800 transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                        className="text-xs font-semibold text-slate-500 hover:text-slate-800 transition-[transform,color] duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] active:scale-95 cursor-pointer whitespace-nowrap shrink-0 touch-manipulation"
                       >
                         Change number
                       </button>
@@ -1781,10 +1788,10 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
                           type="button"
                           onClick={handleSendPhoneOtp}
                           disabled={otpCooldown > 0 || isLoading}
-                          className={`text-xs whitespace-nowrap tabular-nums transition-colors ${
+                          className={`text-xs whitespace-nowrap tabular-nums transition-[transform,color] duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] touch-manipulation ${
                             otpCooldown > 0 || isLoading
                               ? 'text-slate-400 font-semibold cursor-not-allowed'
-                              : 'text-amber-600 hover:text-amber-700 font-bold underline underline-offset-2 decoration-amber-400/70 cursor-pointer'
+                              : 'text-amber-600 hover:text-amber-700 font-bold underline underline-offset-2 decoration-amber-400/70 active:scale-95 cursor-pointer'
                           }`}
                         >
                           {otpCooldown > 0 ? `Resend (${otpCooldown}s)` : 'Resend'}
@@ -1820,7 +1827,7 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
                       <button
                         type="button"
                         onClick={() => setShowPassword(!showPassword)}
-                        className="p-1 text-slate-400 hover:text-slate-600 transition-colors cursor-pointer shrink-0"
+                        className="p-1 text-slate-400 hover:text-slate-700 rounded-full transition-[transform,color,background-color] duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] hover:bg-slate-100 active:scale-90 cursor-pointer shrink-0 touch-manipulation"
                         tabIndex={-1}
                       >
                         {showPassword ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
@@ -1835,7 +1842,7 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
                           setPassword('');
                           resetMessages();
                         }}
-                        className="text-xs font-semibold text-slate-500 hover:text-slate-800 transition-colors cursor-pointer"
+                        className="text-xs font-semibold text-slate-500 hover:text-slate-800 transition-[transform,color] duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] active:scale-95 cursor-pointer touch-manipulation"
                       >
                         Change email
                       </button>
@@ -1847,7 +1854,7 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
                           setAuthStep('forgot');
                           resetMessages();
                         }}
-                        className="text-xs font-semibold text-slate-500 hover:text-slate-800 transition-colors cursor-pointer"
+                        className="text-xs font-semibold text-slate-500 hover:text-slate-800 transition-[transform,color] duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] active:scale-95 cursor-pointer touch-manipulation"
                       >
                         Forgot password?
                       </button>
@@ -1860,11 +1867,15 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
               <button
                 type="submit"
                 disabled={isAnyLoading}
-                className="w-full py-2.5 sm:py-3 px-4 rounded-2xl bg-amber-400 hover:bg-yellow-400 text-slate-950 font-black text-sm transition-all flex items-center justify-center cursor-pointer shadow-xs active:scale-[0.99] disabled:opacity-60 mt-2 relative overflow-hidden group"
+                className="w-full py-2.5 sm:py-3 px-4 rounded-2xl bg-amber-400 hover:bg-amber-300 text-slate-950 font-black text-sm transition-[transform,background-color,box-shadow,opacity] duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] flex items-center justify-center cursor-pointer shadow-[0_4px_14px_-4px_rgba(245,158,11,0.45)] hover:shadow-[0_10px_24px_-6px_rgba(245,158,11,0.6)] hover:-translate-y-[1.5px] active:translate-y-0 active:scale-[0.97] active:shadow-xs disabled:opacity-60 disabled:pointer-events-none mt-2 relative overflow-hidden group touch-manipulation will-change-transform"
               >
+                <span
+                  aria-hidden="true"
+                  className="pointer-events-none absolute inset-0 -translate-x-full group-hover:translate-x-full transition-transform duration-700 ease-out bg-gradient-to-r from-transparent via-white/30 to-transparent"
+                />
                 {/* Center Content: Arrow & Bracket icon placed directly next to text on left side */}
-                <div className="flex items-center justify-center gap-2 font-black truncate px-8">
-                  <LogIn className="w-4 h-4 text-slate-950 shrink-0" />
+                <div className="relative z-10 flex items-center justify-center gap-2 font-black truncate px-8">
+                  <LogIn className="w-4 h-4 text-slate-950 shrink-0 transition-transform duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] group-hover:translate-x-0.5" />
                   <span>
                     {isLoading ? (
                       isPhone
@@ -2003,7 +2014,7 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
                 type="button"
                 onClick={handleGoogleSignIn}
                 disabled={isAnyLoading}
-                className="w-full py-2.5 px-3 rounded-2xl border border-slate-300 hover:bg-slate-50 text-slate-800 font-bold text-xs sm:text-sm transition-all flex items-center justify-center gap-2 bg-white cursor-pointer active:scale-[0.99] disabled:opacity-50 shadow-2xs"
+                className="group w-full py-2.5 px-3 rounded-2xl border border-slate-300 hover:border-slate-400/80 hover:bg-slate-50/90 text-slate-800 hover:text-slate-950 font-bold text-xs sm:text-sm transition-[transform,background-color,border-color,color,box-shadow,opacity] duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] flex items-center justify-center gap-2 bg-white cursor-pointer hover:-translate-y-[1.5px] hover:shadow-[0_8px_18px_-8px_rgba(15,23,42,0.18)] active:translate-y-0 active:scale-[0.96] active:shadow-none disabled:opacity-50 disabled:pointer-events-none shadow-2xs touch-manipulation will-change-transform"
               >
                 {isGoogleLoading ? (
                   <span className="flex items-center gap-1.5 text-xs text-slate-600">
@@ -2012,7 +2023,7 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
                   </span>
                 ) : (
                   <>
-                    <svg className="w-4 h-4 shrink-0" viewBox="0 0 24 24">
+                    <svg className="w-4 h-4 shrink-0 transition-transform duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] group-hover:scale-110" viewBox="0 0 24 24">
                       <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
                       <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
                       <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l2.85-2.22.81-.63z"/>
@@ -2028,7 +2039,7 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
                 type="button"
                 onClick={handlePasskeySignIn}
                 disabled={isAnyLoading}
-                className="w-full py-2.5 px-3 rounded-2xl border border-slate-300 hover:bg-slate-50 text-slate-800 font-bold text-xs sm:text-sm transition-all flex items-center justify-center gap-2 bg-white cursor-pointer active:scale-[0.99] disabled:opacity-50 shadow-2xs"
+                className="group w-full py-2.5 px-3 rounded-2xl border border-slate-300 hover:border-indigo-300 hover:bg-indigo-50/40 text-slate-800 hover:text-slate-950 font-bold text-xs sm:text-sm transition-[transform,background-color,border-color,color,box-shadow,opacity] duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] flex items-center justify-center gap-2 bg-white cursor-pointer hover:-translate-y-[1.5px] hover:shadow-[0_8px_18px_-8px_rgba(79,70,229,0.22)] active:translate-y-0 active:scale-[0.96] active:shadow-none disabled:opacity-50 disabled:pointer-events-none shadow-2xs touch-manipulation will-change-transform"
               >
                 {isPasskeyLoading ? (
                   <span className="flex items-center gap-1.5 text-xs text-slate-600">
@@ -2037,7 +2048,7 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
                   </span>
                 ) : (
                   <>
-                    <Fingerprint className="w-4 h-4 text-indigo-600 shrink-0" />
+                    <Fingerprint className="w-4 h-4 text-indigo-600 shrink-0 transition-transform duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] group-hover:scale-110" />
                     <span>Passkey</span>
                   </>
                 )}
@@ -2058,7 +2069,7 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
                   aria-checked={termsAgreed}
                   aria-label="I have read and agree to Privacy Policy and Terms of Service of SmartRun"
                   onClick={handleToggleTerms}
-                  className={`w-3 h-3 rounded-full border flex items-center justify-center transition-all cursor-pointer shrink-0 select-none ${
+                  className={`w-3 h-3 rounded-full border flex items-center justify-center transition-[transform,background-color,border-color] duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] active:scale-90 cursor-pointer shrink-0 select-none ${
                     termsAgreed
                       ? 'bg-black border-black text-white shadow-2xs'
                       : 'border-slate-500 bg-white hover:border-black'
@@ -2152,7 +2163,7 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
             <button
               type="submit"
               disabled={isAnyLoading}
-              className="w-full py-3 px-4 rounded-2xl bg-amber-400 hover:bg-yellow-400 text-slate-950 font-black text-sm transition-all flex items-center justify-center gap-2 cursor-pointer shadow-xs active:scale-[0.99] disabled:opacity-50 mt-4"
+              className="w-full py-3 px-4 rounded-2xl bg-amber-400 hover:bg-amber-300 text-slate-950 font-black text-sm transition-[transform,background-color,box-shadow,opacity] duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] flex items-center justify-center gap-2 cursor-pointer shadow-[0_4px_14px_-4px_rgba(245,158,11,0.45)] hover:shadow-[0_10px_24px_-6px_rgba(245,158,11,0.6)] hover:-translate-y-[1.5px] active:translate-y-0 active:scale-[0.97] active:shadow-xs disabled:opacity-50 disabled:pointer-events-none mt-4 touch-manipulation will-change-transform"
             >
               {isLoading ? (
                 <span>Saving Profile...</span>
@@ -2244,7 +2255,7 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
                 <button
                   type="button"
                   onClick={() => setShowOnboardingEmailPw(!showOnboardingEmailPw)}
-                  className="p-1 text-slate-400 hover:text-slate-600 transition-colors cursor-pointer shrink-0"
+                  className="p-1 text-slate-400 hover:text-slate-700 rounded-full transition-[transform,color,background-color] duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] hover:bg-slate-100 active:scale-90 cursor-pointer shrink-0 touch-manipulation"
                   tabIndex={-1}
                 >
                   {showOnboardingEmailPw ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
@@ -2256,7 +2267,7 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
             <button
               type="submit"
               disabled={isAnyLoading}
-              className="w-full py-3 px-4 rounded-2xl bg-amber-400 hover:bg-yellow-400 text-slate-950 font-black text-sm transition-all flex items-center justify-center gap-2 cursor-pointer shadow-xs active:scale-[0.99] disabled:opacity-50 mt-4"
+              className="w-full py-3 px-4 rounded-2xl bg-amber-400 hover:bg-amber-300 text-slate-950 font-black text-sm transition-[transform,background-color,box-shadow,opacity] duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] flex items-center justify-center gap-2 cursor-pointer shadow-[0_4px_14px_-4px_rgba(245,158,11,0.45)] hover:shadow-[0_10px_24px_-6px_rgba(245,158,11,0.6)] hover:-translate-y-[1.5px] active:translate-y-0 active:scale-[0.97] active:shadow-xs disabled:opacity-50 disabled:pointer-events-none mt-4 touch-manipulation will-change-transform"
             >
               {isLoading ? (
                 <span>Creating Account...</span>
@@ -2300,7 +2311,7 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
             <button
               type="submit"
               disabled={isAnyLoading}
-              className="w-full py-3 px-4 rounded-2xl bg-amber-400 hover:bg-yellow-400 text-slate-950 font-black text-sm transition-all flex items-center justify-center gap-2 cursor-pointer shadow-xs active:scale-[0.99] disabled:opacity-50 mt-2"
+              className="w-full py-3 px-4 rounded-2xl bg-amber-400 hover:bg-amber-300 text-slate-950 font-black text-sm transition-[transform,background-color,box-shadow,opacity] duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] flex items-center justify-center gap-2 cursor-pointer shadow-[0_4px_14px_-4px_rgba(245,158,11,0.45)] hover:shadow-[0_10px_24px_-6px_rgba(245,158,11,0.6)] hover:-translate-y-[1.5px] active:translate-y-0 active:scale-[0.97] active:shadow-xs disabled:opacity-50 disabled:pointer-events-none mt-2 touch-manipulation will-change-transform"
             >
               {isLoading ? (
                 'Sending Reset Link...'
@@ -2319,7 +2330,7 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
                   setAuthStep('primary');
                   resetMessages();
                 }}
-                className="text-xs font-bold text-amber-700 hover:text-amber-800 cursor-pointer"
+                className="text-xs font-bold text-amber-700 hover:text-amber-800 transition-[transform,color] duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] active:scale-95 cursor-pointer touch-manipulation"
               >
                 Back to Sign in
               </button>
