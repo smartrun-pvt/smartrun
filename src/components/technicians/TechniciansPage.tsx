@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useMemo, useDeferredValue } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import { Search, X, RefreshCw, UserCheck, Wrench, Sparkles, ShieldCheck } from 'lucide-react';
+import { Search, X, RefreshCw, UserCheck } from 'lucide-react';
 import { motion } from 'motion/react';
 import { Technician } from '../../types/technician';
 import { TechnicianCard } from './TechnicianCard';
@@ -27,6 +27,13 @@ const INITIAL_FILTERS: TechnicianFilterState = {
   areas: [],
   minRating: undefined
 };
+
+const ALL_TECHNICIAN_SPECIALTIES = [
+  'Fault Repair',
+  'Plumbing',
+  'Technician',
+  'Electrician'
+];
 
 export const TechniciansPage = React.memo(({
   searchQuery: propSearchQuery = '',
@@ -393,8 +400,16 @@ export const TechniciansPage = React.memo(({
     return 'Sorted';
   };
 
+  const isEmptyNetwork = !isLoading && allTechnicians.length === 0;
+
   return (
-    <div className="min-h-[85vh] bg-slate-50 flex flex-col justify-start items-center px-4 pt-4 sm:pt-6 pb-36 sm:pb-28">
+    <div
+      className={
+        isEmptyNetwork
+          ? 'min-h-screen bg-white text-slate-900 px-4 sm:px-6 pt-4 pb-36 sm:pb-24 font-sans'
+          : 'min-h-[85vh] bg-slate-50 flex flex-col justify-start items-center px-4 pt-4 sm:pt-6 pb-36 sm:pb-28'
+      }
+    >
       <SEOHead
         title={activeQuery ? `"${activeQuery}" - Certified Electricians & Wiring Contractors Kolkata | SmartRun` : 'Certified Electricians & House Wiring Contractors Kolkata | SmartRun'}
         description="Book verified, licensed electrical contractors, home wiring technicians, switchboard repair, and industrial electrification specialists in Kolkata with instant booking."
@@ -556,7 +571,7 @@ export const TechniciansPage = React.memo(({
       )}
 
       {/* Main Content Area: Responsive Grid (Stack on Phone, 2*2 on PC) */}
-      <div className="w-full max-w-5xl mx-auto">
+      <div className={isEmptyNetwork ? 'w-full max-w-7xl mx-auto' : 'w-full max-w-5xl mx-auto'}>
         {isLoading ? (
           <div className="py-20 text-center">
             <RefreshCw className="w-8 h-8 text-blue-600 animate-spin mx-auto mb-3" />
@@ -565,39 +580,24 @@ export const TechniciansPage = React.memo(({
             </p>
           </div>
         ) : allTechnicians.length === 0 ? (
-          /* COMING SOON VIEW (When no technician is in Supabase yet) */
-          <div className="py-16 sm:py-20 px-6 text-center max-w-lg mx-auto bg-white rounded-3xl border-0 border-none shadow-none space-y-5">
-            <div className="w-16 h-16 rounded-3xl bg-blue-50 text-blue-600 flex items-center justify-center mx-auto shadow-2xs">
-              <Wrench className="w-8 h-8 stroke-[1.75]" />
-            </div>
+          /* =========================================================================
+             EMPTY TECHNICIAN NETWORK STATE (Matches Construction empty catalog design)
+             ========================================================================= */
+          <div className="min-h-[55vh] py-16 sm:py-24 flex flex-col items-center justify-center text-center">
+            <div className="w-full max-w-2xl mx-auto flex flex-col items-center gap-7 sm:gap-8">
+              <h1 className="text-2xl sm:text-3xl font-black text-slate-900 tracking-tight whitespace-nowrap">
+                Coming Soon
+              </h1>
 
-            <div className="space-y-2">
-              <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-blue-50 text-blue-700 text-xs font-bold">
-                <Sparkles className="w-3.5 h-3.5" />
-                <span>Onboarding in Progress</span>
-              </div>
-              <h3 className="text-xl sm:text-2xl font-bold text-slate-900">
-                Technician Network Coming Soon
-              </h3>
-              <p className="text-xs sm:text-sm text-slate-500 max-w-md mx-auto leading-relaxed">
-                We are actively verifying and onboarding licensed electricians, solar power engineers, and industrial switchgear specialists across Kolkata.
-              </p>
-            </div>
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-2 text-left">
-              <div className="p-3.5 rounded-2xl bg-slate-50 flex items-start gap-2.5">
-                <ShieldCheck className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
-                <div>
-                  <h4 className="text-xs font-bold text-slate-800">Govt. Verified</h4>
-                  <p className="text-[11px] text-slate-500">Class-1 licenses & background check.</p>
-                </div>
-              </div>
-              <div className="p-3.5 rounded-2xl bg-slate-50 flex items-start gap-2.5">
-                <ShieldCheck className="w-4 h-4 text-blue-600 shrink-0 mt-0.5" />
-                <div>
-                  <h4 className="text-xs font-bold text-slate-800">Direct Contact</h4>
-                  <p className="text-[11px] text-slate-500">Transparent rates & instant booking.</p>
-                </div>
+              <div className="flex flex-wrap items-center justify-center gap-2.5 sm:gap-3">
+                {ALL_TECHNICIAN_SPECIALTIES.map((specialty) => (
+                  <span
+                    key={specialty}
+                    className="inline-flex items-center justify-center px-4 py-2 rounded-full bg-gradient-to-b from-white via-slate-50/90 to-slate-100 border border-slate-200/90 text-slate-800 text-xs sm:text-[13px] font-bold tracking-tight whitespace-nowrap select-none shadow-[0_6px_14px_-4px_rgba(15,23,42,0.14),0_2px_4px_-1px_rgba(15,23,42,0.08),inset_0_1.5px_1px_rgba(255,255,255,0.98),inset_0_-2px_3px_rgba(15,23,42,0.06)]"
+                  >
+                    {specialty}
+                  </span>
+                ))}
               </div>
             </div>
           </div>
