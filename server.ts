@@ -2240,9 +2240,13 @@ async function startServer() {
   // Resolve Email OTP HMAC secret once at startup (no hardcoded fallback)
   const EMAIL_OTP_HMAC_SECRET = resolveEmailOtpSecret(process.env);
   if (!EMAIL_OTP_HMAC_SECRET) {
-    console.error(
-      "[Security Startup Error] API_SECRET_KEY or SESSION_SECRET is unset. Email OTP endpoints will fail closed with HTTP 500 until configured."
-    );
+    const missingSecretMsg =
+      "[Security Startup Notice] API_SECRET_KEY or SESSION_SECRET is unset. Email OTP endpoints will fail closed with HTTP 500 until configured.";
+    if (process.env.NODE_ENV === "production") {
+      console.error(missingSecretMsg);
+    } else {
+      console.log(missingSecretMsg);
+    }
   }
 
   // Set trust proxy to trust Cloud Run, Render, and reverse proxy headers (X-Forwarded-For)

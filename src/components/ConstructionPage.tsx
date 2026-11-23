@@ -11,11 +11,6 @@ import {
   X,
   Search,
   Check,
-  Building2,
-  HardHat,
-  MessageSquare,
-  PhoneCall,
-  Clock,
   ArrowUpDown,
   Zap
 } from 'lucide-react';
@@ -693,88 +688,24 @@ export const ConstructionPage = React.memo(({
           </div>
         ) : !hasBackendProducts ? (
           /* =========================================================================
-             CONSTRUCTION SUPPLIES DESK STATE (When catalog loads dynamically from contractor desk)
+             EMPTY CONSTRUCTION CATALOG STATE (Strictly when zero construction products exist)
              ========================================================================= */
-          <div className="py-12 sm:py-16">
-            <div className="max-w-3xl mx-auto bg-slate-50/70 border border-slate-200/80 rounded-3xl p-8 sm:p-12 text-center shadow-xs space-y-6">
-              
-              {/* Icon Illustration */}
-              <div className="relative inline-flex items-center justify-center">
-                <div className="w-20 h-20 rounded-2xl bg-amber-100/80 border border-amber-300/60 text-amber-700 flex items-center justify-center shadow-xs">
-                  <Building2 className="w-10 h-10 stroke-[1.8]" />
-                </div>
-                <div className="absolute -bottom-1.5 -right-1.5 w-7 h-7 rounded-full bg-amber-500 text-slate-950 flex items-center justify-center shadow-xs">
-                  <Clock className="w-4 h-4" />
-                </div>
+          <div className="min-h-[55vh] py-16 sm:py-24 flex flex-col items-center justify-center text-center">
+            <div className="w-full max-w-2xl mx-auto flex flex-col items-center gap-7 sm:gap-8">
+              <h1 className="text-2xl sm:text-3xl font-black text-slate-900 tracking-tight whitespace-nowrap">
+                Coming Soon
+              </h1>
+
+              <div className="flex flex-wrap items-center justify-center gap-2.5 sm:gap-3">
+                {ALL_CONSTRUCTION_BRANDS.map((brand) => (
+                  <span
+                    key={brand}
+                    className="inline-flex items-center justify-center px-4 py-2 rounded-full bg-gradient-to-b from-white via-slate-50/90 to-slate-100 border border-slate-200/90 text-slate-800 text-xs sm:text-[13px] font-bold tracking-tight whitespace-nowrap select-none shadow-[0_6px_14px_-4px_rgba(15,23,42,0.14),0_2px_4px_-1px_rgba(15,23,42,0.08),inset_0_1.5px_1px_rgba(255,255,255,0.98),inset_0_-2px_3px_rgba(15,23,42,0.06)]"
+                  >
+                    {brand}
+                  </span>
+                ))}
               </div>
-
-              {/* Header & Description */}
-              <div className="space-y-2.5 max-w-lg mx-auto">
-                <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-amber-500/15 border border-amber-500/30 text-amber-800 text-[11px] font-black uppercase tracking-wider">
-                  <HardHat className="w-3.5 h-3.5 text-amber-700" />
-                  <span>Kasba Central Depot • Kolkata</span>
-                </div>
-                
-                <h1 className="text-2xl sm:text-3xl font-black text-slate-900 tracking-tight">
-                  Construction &amp; Building Supplies Desk — Kolkata
-                </h1>
-
-                <p className="text-xs sm:text-sm text-slate-600 font-medium leading-relaxed">
-                  Request same-day site dispatch and bulk GST quotations across Kolkata for UltraTech cement, Tata Tiscon TMT rebars, Astral CPVC pipes, Dr. Fixit waterproofing, and structural hardware.
-                </p>
-              </div>
-
-              {/* Brands Anticipation Grid */}
-              <div className="pt-2 pb-1">
-                <p className="text-[11px] font-bold uppercase tracking-wider text-slate-400 mb-3">
-                  Upcoming Wholesale Authorized Brands
-                </p>
-                <div className="flex flex-wrap items-center justify-center gap-2 max-w-xl mx-auto">
-                  {ALL_CONSTRUCTION_BRANDS.map((brand) => (
-                    <span
-                      key={brand}
-                      className="px-3 py-1.5 rounded-xl bg-white border border-slate-200 text-slate-700 text-xs font-bold shadow-2xs"
-                    >
-                      {brand}
-                    </span>
-                  ))}
-                </div>
-              </div>
-
-
-
-              {/* Action Buttons for Direct Inquiry - Equal Size & Liquid Glossy Design */}
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 w-full max-w-xl mx-auto pt-3">
-                {/* 1. WhatsApp Liquid Gloss Button */}
-                <a
-                  href="https://wa.me/918777400280?text=Hello%20SmartRun,%20I%20need%20a%20wholesale%20quote%20for%20construction%20materials."
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="relative group overflow-hidden w-full h-12 min-h-[48px] px-3.5 rounded-2xl bg-gradient-to-b from-emerald-500 via-emerald-600 to-emerald-700 text-white font-bold text-xs sm:text-[13px] tracking-tight shadow-[0_8px_20px_-4px_rgba(16,185,129,0.38),inset_0_1px_1px_rgba(255,255,255,0.65),inset_0_-2px_4px_rgba(0,0,0,0.18)] border border-emerald-400/40 hover:from-emerald-400 hover:to-emerald-600 active:scale-[0.98] transition-all flex items-center justify-center gap-2 cursor-pointer before:absolute before:inset-x-0 before:top-0 before:h-1/2 before:bg-gradient-to-b before:from-white/35 before:to-transparent before:pointer-events-none before:rounded-t-2xl"
-                >
-                  <MessageSquare className="w-4 h-4 shrink-0 drop-shadow-xs" />
-                  <span className="truncate">WhatsApp Quote</span>
-                </a>
-
-                {/* 2. Call Contractor Liquid Gloss Button */}
-                <a
-                  href="tel:+918777400280"
-                  className="relative group overflow-hidden w-full h-12 min-h-[48px] px-3.5 rounded-2xl bg-gradient-to-b from-amber-400 via-amber-500 to-amber-600 text-slate-950 font-bold text-xs sm:text-[13px] tracking-tight shadow-[0_8px_20px_-4px_rgba(245,158,11,0.35),inset_0_1px_1px_rgba(255,255,255,0.75),inset_0_-2px_4px_rgba(0,0,0,0.12)] border border-amber-300/60 hover:from-amber-300 hover:to-amber-500 active:scale-[0.98] transition-all flex items-center justify-center gap-2 cursor-pointer before:absolute before:inset-x-0 before:top-0 before:h-1/2 before:bg-gradient-to-b before:from-white/40 before:to-transparent before:pointer-events-none before:rounded-t-2xl"
-                >
-                  <PhoneCall className="w-4 h-4 shrink-0 drop-shadow-xs" />
-                  <span className="truncate">Call Contractor</span>
-                </a>
-
-                {/* 3. Browse Electrical Store Liquid Gloss Button */}
-                <Link
-                  to="/electrical"
-                  className="relative group overflow-hidden w-full h-12 min-h-[48px] px-3.5 rounded-2xl bg-gradient-to-b from-slate-800 via-slate-900 to-slate-950 text-white font-bold text-xs sm:text-[13px] tracking-tight shadow-[0_8px_20px_-4px_rgba(15,23,42,0.38),inset_0_1px_1px_rgba(255,255,255,0.35),inset_0_-2px_4px_rgba(0,0,0,0.25)] border border-slate-700/60 hover:from-slate-700 hover:to-slate-900 active:scale-[0.98] transition-all flex items-center justify-center gap-2 cursor-pointer before:absolute before:inset-x-0 before:top-0 before:h-1/2 before:bg-gradient-to-b before:from-white/20 before:to-transparent before:pointer-events-none before:rounded-t-2xl"
-                >
-                  <Zap className="w-4 h-4 shrink-0 text-amber-400 drop-shadow-xs" />
-                  <span className="truncate">Electrical Store</span>
-                </Link>
-              </div>
-
             </div>
           </div>
         ) : paginatedProducts.length === 0 ? (
