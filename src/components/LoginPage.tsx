@@ -28,6 +28,7 @@ import { supabase } from '../lib/supabaseClient';
 import { apiUrl } from '../lib/apiBase';
 import { isAndroidAppEnvironment, isNativePhoneApp } from '../utils/platformDetection';
 import { SEOHead } from './SEOHead';
+import { LoginHeroBanner } from './LoginHeroBanner';
 import {
   saveUserProfile,
   signInWithGoogle
@@ -1513,19 +1514,17 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
   }
 
   return (
-    <div className="min-h-[100dvh] bg-white flex flex-col justify-end items-center px-4 pt-[calc(var(--safe-area-top,env(safe-area-inset-top,0px))+4.5rem)] pb-4 sm:pt-[calc(var(--safe-area-top,env(safe-area-inset-top,0px))+5rem)] sm:pb-8 relative overflow-x-hidden overflow-y-auto overscroll-contain">
+    <div className="min-h-[100dvh] bg-[linear-gradient(135deg,#ffcc00_0%,#ffcc00_50%,#f8fafc_50%,#f8fafc_100%)] flex flex-col items-center relative overflow-x-hidden overflow-y-auto overscroll-contain">
       <SEOHead
         title="Sign In / Register | SmartRun Express Electricals"
         description="Sign in to your SmartRun account with mobile OTP, email, or Google to track express delivery orders, manage addresses, and access wholesale pricing."
         keywords="smartrun login, smartrun signup, electrical depot account, mobile otp login"
       />
 
-      {/* Fixed Top Back Navigation Button - Positioned safely below Android status bar & clock/battery */}
+      {/* Fixed Top Back Navigation Button - Always clears Android status bar, notifications, signal & battery */}
       <div
-        className={`fixed left-4 sm:left-6 z-30 ${
-          isNativeApp
-            ? 'top-[calc(max(var(--safe-area-top,env(safe-area-inset-top,0px)),28px)+0.875rem)]'
-            : 'top-[calc(var(--safe-area-top,env(safe-area-inset-top,0px))+1.25rem)] sm:top-[calc(var(--safe-area-top,env(safe-area-inset-top,0px))+1.5rem)]'
+        className={`fixed z-40 login-safe-top-anchor ${
+          isNativeApp ? 'login-safe-top-native' : ''
         }`}
       >
         <button
@@ -1541,7 +1540,7 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
               navigate('/', { replace: true });
             }
           }}
-          className="group px-3 py-1.5 bg-white/90 backdrop-blur-md border border-slate-200/80 shadow-[0_2px_10px_-3px_rgba(15,23,42,0.12)] text-slate-700 hover:text-slate-950 hover:bg-slate-50 hover:border-slate-300/90 hover:shadow-[0_6px_16px_-6px_rgba(15,23,42,0.16)] rounded-full transition-[transform,background-color,border-color,color,box-shadow] duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] cursor-pointer flex items-center gap-1.5 hover:-translate-x-0.5 active:scale-[0.94] active:translate-x-0 text-xs font-bold touch-manipulation will-change-transform"
+          className="group px-3.5 py-1.5 bg-white/95 backdrop-blur-md border border-slate-200/90 shadow-[0_4px_14px_-3px_rgba(15,23,42,0.18)] text-slate-800 hover:text-slate-950 hover:bg-white hover:border-slate-300 hover:shadow-[0_6px_18px_-6px_rgba(15,23,42,0.22)] rounded-full transition-[transform,background-color,border-color,color,box-shadow] duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] cursor-pointer flex items-center gap-1.5 hover:-translate-x-0.5 active:scale-[0.94] active:translate-x-0 text-xs font-bold touch-manipulation will-change-transform"
           title={authStep !== 'primary' ? 'Back' : 'Back to Store'}
         >
           <ArrowLeft className="w-4 h-4 stroke-[2.5] transition-transform duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] group-hover:-translate-x-0.5" />
@@ -1549,41 +1548,17 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
         </button>
       </div>
 
-      {/* Main Login Container - Positioned towards bottom of screen across all devices */}
+      {/* Hero Section Background: Instant Native Animated SmartRun Hero (#ffcc00 box, #c1ff72 echo, black burst wordmark) */}
+      <LoginHeroBanner isKeyboardOpen={isKeyboardOpen} />
+
+      {/* Main Login Container */}
       <div
-        className={`w-full max-w-md bg-white border-0 shadow-none px-4 transition-all duration-300 ${
-          isKeyboardOpen ? 'space-y-2 py-1 my-0' : 'space-y-3 sm:space-y-3.5 mt-auto mb-3 sm:mb-6 pt-4 pb-6 sm:pb-8'
+        className={`relative z-10 w-full max-w-none sm:max-w-md flex-1 sm:flex-none flex flex-col justify-center bg-white rounded-t-[28px] sm:rounded-[28px] -mt-5 mb-0 sm:mb-8 border-t sm:border border-slate-100/90 shadow-[0_-10px_30px_-14px_rgba(15,23,42,0.12)] sm:shadow-[0_14px_40px_-12px_rgba(15,23,42,0.14)] px-6 sm:px-7 transition-all duration-300 ${
+          isKeyboardOpen
+            ? 'space-y-2 pt-4 pb-4'
+            : 'space-y-3.5 sm:space-y-4 pt-7 pb-[calc(var(--safe-area-bottom,env(safe-area-inset-bottom,0px))+2rem)] sm:py-8'
         }`}
       >
-
-        {/* Brand Logo & Name Header - Scales smoothly when virtual keyboard opens to keep input in view */}
-        <div className={`flex flex-col items-center justify-center text-center transition-all duration-200 ${isKeyboardOpen ? 'space-y-1' : 'space-y-1.5'}`}>
-          <div>
-            <img
-              src="/SmartRun.png"
-              alt="SmartRun Logo"
-              className={`object-cover rounded-2xl sm:rounded-3xl transition-all duration-200 ${
-                isKeyboardOpen ? 'w-12 h-12' : 'w-18 h-18 sm:w-22 sm:h-22'
-              }`}
-            />
-          </div>
-
-          <div>
-            <div
-              className={`font-black font-baloo text-black flex items-center justify-center leading-none tracking-tight transition-all duration-200 ${
-                isKeyboardOpen ? 'text-2xl' : 'text-3xl sm:text-4xl'
-              }`}
-              style={{ fontFamily: "'Baloo 2', 'Baloo Bhai 2', cursive, sans-serif" }}
-            >
-              <span className="text-black">SmartRun</span>
-            </div>
-            {!isKeyboardOpen && (
-              <p className="text-xs sm:text-sm text-slate-500 font-semibold mt-1">
-                Electrical &amp; Construction Materials Hub
-              </p>
-            )}
-          </div>
-        </div>
 
         {/* Onboarding Subtitle */}
         {(authStep === 'onboarding_phone' || authStep === 'onboarding_email') && (
@@ -1623,8 +1598,8 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
             <form onSubmit={handlePrimarySubmit} className="space-y-4">
               {/* Field 1: Mobile Number or Email */}
               <div>
-                <label className="block text-xs font-bold text-slate-800 tracking-wider uppercase mb-1">
-                  MOBILE NO. / EMAIL
+                <label className="block text-xs font-bold text-slate-800 tracking-wider mb-1">
+                  Sign In
                 </label>
                 <div className="flex items-center border-b border-slate-300 focus-within:border-slate-800 transition-colors pb-1">
                   {isPhone ? (

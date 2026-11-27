@@ -469,3 +469,89 @@ button[aria-label^="Previous product image"] {
   }
 }
 
+/* Login floating Store/Back button safe-area anchor:
+   Guarantees clearance below phone status bar, notifications, punch-hole camera,
+   mobile signal, and battery indicators across Capacitor APKs, WebView wrappers,
+   PWAs, and mobile browsers. */
+.login-safe-top-anchor {
+  top: 60px;
+  top: max(
+    calc(var(--safe-area-top, 0px) + 16px),
+    calc(env(safe-area-inset-top, 0px) + 16px),
+    60px
+  );
+  left: 16px;
+  left: max(
+    calc(var(--safe-area-left, 0px) + 16px),
+    calc(env(safe-area-inset-left, 0px) + 16px),
+    16px
+  );
+}
+
+@media (min-width: 640px) {
+  .login-safe-top-anchor:not(.login-safe-top-native) {
+    top: 24px;
+    top: calc(var(--safe-area-top, env(safe-area-inset-top, 0px)) + 1.5rem);
+    left: 24px;
+  }
+}
+
+/* =========================================================================
+   LOGIN HERO NATIVE CHARACTER BOUNCE LOOP + ECHO (OFFSET 20, #c1ff72)
+   ========================================================================= */
+@keyframes login-char-bounce-loop {
+  0% {
+    transform: translate3d(0, 0, 0) scale(1, 1);
+  }
+  8% {
+    transform: translate3d(0, 2px, 0) scale(1.06, 0.93);
+  }
+  22% {
+    transform: translate3d(0, -17px, 0) scale(0.95, 1.08);
+  }
+  34% {
+    transform: translate3d(0, 2.5px, 0) scale(1.05, 0.94);
+  }
+  44% {
+    transform: translate3d(0, -8px, 0) scale(0.98, 1.04);
+  }
+  53% {
+    transform: translate3d(0, 1px, 0) scale(1.02, 0.98);
+  }
+  60% {
+    transform: translate3d(0, -2.5px, 0) scale(0.995, 1.01);
+  }
+  66%, 100% {
+    transform: translate3d(0, 0, 0) scale(1, 1);
+  }
+}
+
+.login-bounce-letter {
+  transform-origin: center bottom;
+  animation: login-char-bounce-loop 2.5s cubic-bezier(0.28, 0.84, 0.42, 1) infinite;
+  will-change: transform;
+}
+
+/* Canva Echo effect at Offset: 20 (tight crisp offset behind black text) */
+.login-echo-layer-1 {
+  opacity: 0.82;
+  transform: translate3d(2.5px, 2.5px, 0);
+  will-change: transform;
+}
+
+.login-echo-layer-2 {
+  opacity: 0.44;
+  transform: translate3d(5px, 5px, 0);
+  will-change: transform;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .login-bounce-letter {
+    animation: none !important;
+    transform: none !important;
+  }
+}
+
+
+
+
