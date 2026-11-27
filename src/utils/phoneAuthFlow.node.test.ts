@@ -15,6 +15,13 @@ import {
   normalizeNativeFirebaseAuthError,
   buildRecaptchaSlotId,
   isRecaptchaAlreadyRenderedError,
+  FAST_SMS_ABORT_TIMEOUT_MS,
+  NATIVE_SLOW_SEND_NOTICE_MS,
+  NATIVE_SLOW_SEND_INFO_MESSAGE,
+  OTP_RESEND_COOLDOWN_SECONDS,
+  resolveNextOtpProvider,
+  shouldStopOnFastSmsResponse,
+  shouldRetryFast2SmsVerifyAfterFirebaseFailure,
 } from './firebaseAuthDomain';
 import { extractOtpDigits } from './otpAutofill';
 import { resolveWebAuthnRpConfig } from './passkeyHelper';
@@ -254,4 +261,81 @@ test('AndroidManifest HTTPS App Links scope to app routes so /__/auth/* is never
   assert.doesNotMatch(filterBody, /\/__\/auth/);
   assert.doesNotMatch(filterBody, /\/__\/firebase/);
 });
+
+test('OTP reliability policy: provider alternation, 429 fallthrough, timers, and ambiguous abort retry', () => {
+  // Constants match Android APK reliability thresholds
+  assert.equal(FAST_SMS_ABORT_TIMEOUT_MS, 12000);
+  assert.equal(NATIVE_SLOW_SEND_NOTICE_MS, 15000);
+  assert.equal(OTP_RESEND_COOLDOWN_SECONDS, 30);
+  assert.equal(NATIVE_SLOW_SEND_INFO_MESSAGE, 'Taking longer than usual, please check your signal');
+
+  // First send always uses default gateway order
+  assert.equal(resolveNextOtpProvider({ sendAttempt: 0, lastProvider: null }), undefined);
+  assert.equal(resolveNextOtpProvider({ sendAttempt: 0, lastProvider: 'fast2sms' }), undefined);
+  assert.equal(resolveNextOtpProvider({ sendAttempt: 0, lastProvider: 'firebase' }), undefined);
+
+  // Resends for the same number alternate to the OTHER provider
+  assert.equal(resolveNextOtpProvider({ sendAttempt: 1, lastProvider: 'fast2sms' }), 'firebase');
+  assert.equal(resolveNextOtpProvider({ sendAttempt: 2, lastProvider: 'firebase' }), 'fast2sms');
+  assert.equal(resolveNextOtpProvider({ sendAttempt: 1, lastProvider: null }), undefined);
+
+  // HTTP 429 from /api/auth/send-phone-otp must fall through to native Firebase (never stop)
+  assert.equal(
+    shouldStopOnFastSmsResponse({ status: 429, error: 'Too many requests', fallbackToFirebase: false }),
+    false
+  );
+  assert.equal(
+    shouldStopOnFastSmsResponse({ status: 429, error: 'Please wait 5 seconds' }),
+    false
+  );
+  assert.equal(
+    shouldStopOnFastSmsResponse({ status: 502, error: 'Gateway timeout', fallbackToFirebase: true }),
+    false
+  );
+  // HTTP 400 validation error without fallbackToFirebase stops immediately
+  assert.equal(
+    shouldStopOnFastSmsResponse({ status: 400, error: 'Invalid phone number.' }),
+    true
+  );
+
+  // Ambiguous Fast2SMS abort retry triggers only on auth/invalid-verification-code for same phone
+  assert.equal(
+    shouldRetryFast2SmsVerifyAfterFirebaseFailure({
+      firebaseErrorCode: 'auth/invalid-verification-code',
+      fastSmsMayHaveSent: true,
+      fastSmsMayHaveSentPhone: '9876543210',
+      targetPhone: '+919876543210',
+    }),
+    true
+  );
+  assert.equal(
+    shouldRetryFast2SmsVerifyAfterFirebaseFailure({
+      firebaseErrorCode: 'auth/invalid-verification-code',
+      fastSmsMayHaveSent: false,
+      fastSmsMayHaveSentPhone: '9876543210',
+      targetPhone: '+919876543210',
+    }),
+    false
+  );
+  assert.equal(
+    shouldRetryFast2SmsVerifyAfterFirebaseFailure({
+      firebaseErrorCode: 'auth/code-expired',
+      fastSmsMayHaveSent: true,
+      fastSmsMayHaveSentPhone: '9876543210',
+      targetPhone: '+919876543210',
+    }),
+    false
+  );
+  // Cross-phone isolation: never retry Fast2SMS verify for a different phone number
+  assert.equal(
+    shouldRetryFast2SmsVerifyAfterFirebaseFailure({
+      firebaseErrorCode: 'auth/invalid-verification-code',
+      fastSmsMayHaveSent: true,
+      fastSmsMayHaveSentPhone: '9876543210',
+      targetPhone: '+919876543219',
+    }),
+    false
+  );
+});
+
 

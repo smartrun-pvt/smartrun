@@ -405,3 +405,75 @@ export function isRateLimitErrorCode(code: string): boolean {
   return c === 'auth/too-many-requests' || c === 'auth/quota-exceeded';
 }
 
+export type OtpProvider = 'fast2sms' | 'firebase';
+
+export const FAST_SMS_ABORT_TIMEOUT_MS = 12000;
+export const NATIVE_SLOW_SEND_NOTICE_MS = 15000;
+export const OTP_RESEND_COOLDOWN_SECONDS = 30;
+export const NATIVE_SLOW_SEND_INFO_MESSAGE = 'Taking longer than usual, please check your signal';
+
+/**
+ * Resolves the `forceProvider` override for a phone OTP send attempt.
+ * - First send for a phone number (`sendAttempt <= 0`): returns `undefined` (default gateway order).
+ * - Resends (`sendAttempt > 0`) for the same number: alternates to the OTHER provider than `lastProvider`
+ *   so silent non-delivery on one gateway is covered by the other.
+ */
+export function resolveNextOtpProvider(params: {
+  sendAttempt: number;
+  lastProvider: OtpProvider | null | undefined;
+}): OtpProvider | undefined {
+  if (!Number.isFinite(params.sendAttempt) || params.sendAttempt <= 0) {
+    return undefined;
+  }
+  if (params.lastProvider === 'fast2sms') {
+    return 'firebase';
+  }
+  if (params.lastProvider === 'firebase') {
+    return 'fast2sms';
+  }
+  return undefined;
+}
+
+/**
+ * Determines whether a non-OK response from `/api/auth/send-phone-otp` should stop immediately
+ * with a user-facing validation error or fall through to Firebase Phone Auth.
+ * HTTP 429 MUST always fall through to Firebase rather than blocking the user.
+ */
+export function shouldStopOnFastSmsResponse(params: {
+  status: number;
+  error?: string;
+  fallbackToFirebase?: boolean;
+}): boolean {
+  if (params.status === 429) {
+    return false;
+  }
+  if (params.status === 400 && Boolean(params.error) && !params.fallbackToFirebase) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Determines whether a Firebase OTP confirmation failure should trigger a single fallback retry
+ * against `POST /api/auth/verify-phone-otp` (`{ phone, otp }`, no token) because an earlier
+ * Fast2SMS request timed out/aborted with an unknown outcome (`fastSmsMayHaveSent === true`).
+ */
+export function shouldRetryFast2SmsVerifyAfterFirebaseFailure(params: {
+  firebaseErrorCode: string;
+  fastSmsMayHaveSent: boolean;
+  fastSmsMayHaveSentPhone?: string | null;
+  targetPhone?: string | null;
+}): boolean {
+  if (!params.fastSmsMayHaveSent) return false;
+  if (String(params.firebaseErrorCode || '').toLowerCase() !== 'auth/invalid-verification-code') {
+    return false;
+  }
+  const flagDigits = String(params.fastSmsMayHaveSentPhone || '').replace(/\D/g, '').slice(-10);
+  const targetDigits = String(params.targetPhone || '').replace(/\D/g, '').slice(-10);
+  if (flagDigits && targetDigits && flagDigits !== targetDigits) {
+    return false;
+  }
+  return true;
+}
+
+

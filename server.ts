@@ -62,10 +62,23 @@ import {
   verifyFetchedRazorpayOrder,
   sanitizeRazorpayOrderNotes,
   evaluateRazorpayWebhookOrderUpdate,
-  decideEmailOtpVerificationOutcome
+  decideEmailOtpVerificationOutcome,
+  SMS_OTP_IP_WINDOW_MS,
+  SMS_OTP_IP_MAX,
+  SMS_OTP_PHONE_WINDOW_MS,
+  SMS_OTP_PHONE_MAX,
+  FAST2SMS_DISPATCH_TIMEOUT_MS,
+  resolveTrustedClientIp,
+  extractSmsOtpPhoneKey,
+  formatFast2SmsResponseLog,
+  resolveServerAuthSecret
 } from "./src/utils/orderSecurity";
 
 dotenv.config();
+
+// Fail fast at startup in production if SESSION_SECRET, SUPABASE_SERVICE_ROLE_KEY, and JWT_SECRET are all unset
+// so signed session and OTP tokens verify consistently across every Cloud Run instance.
+const SERVER_AUTH_SECRET = resolveServerAuthSecret(process.env);
 
 // Resolve directory in both CJS bundle and ESM environments cleanly
 const __filenameResolved = typeof __filename !== "undefined" ? __filename : process.cwd();
@@ -1827,14 +1840,9 @@ function sanitize(input: unknown): string {
   return input.replace(/[<>]/g, "").trim();
 }
 
-// Safe client IP generator supporting Cloud Run, Nginx, and reverse proxy headers
-const getClientIp = (req: express.Request): string => {
-  const forwarded = req.headers["x-forwarded-for"];
-  if (typeof forwarded === "string" && forwarded) {
-    return forwarded.split(",")[0].trim();
-  }
-  return req.ip || req.socket.remoteAddress || "127.0.0.1";
-};
+// Trusted client IP generator relying on Express req.ip with `app.set("trust proxy", 1)`
+// (never reads the spoofable first x-forwarded-for entry)
+const getClientIp = (req: express.Request): string => resolveTrustedClientIp(req);
 
 // apiLimiter: 5000 requests per 15 minutes, applied to all general /api/ routes
 const apiLimiter = rateLimit({
@@ -1912,17 +1920,34 @@ function requireApiSecret(req: express.Request, res: express.Response, next: exp
   next();
 }
 
-// smsOtpLimiter: 10 OTP requests per 10 minutes per IP to prevent SMS bombing & wallet depletion
+// smsOtpLimiter: 30 OTP requests per 10 minutes per IP (accounts for carrier CGNAT shared IPs)
 const smsOtpLimiter = rateLimit({
-  windowMs: 10 * 60 * 1000,
-  max: 10,
+  windowMs: SMS_OTP_IP_WINDOW_MS,
+  max: SMS_OTP_IP_MAX,
   standardHeaders: true,
   legacyHeaders: false,
   validate: { xForwardedForHeader: false, forwardedHeader: false, default: false },
   keyGenerator: getClientIp,
   message: {
     success: false,
+    fallbackToFirebase: true,
     error: "Too many SMS requests from this network. Please wait a few minutes before trying again."
+  }
+});
+
+// smsOtpPhoneLimiter: 5 OTP sends per 30 minutes per 10-digit phone number
+const smsOtpPhoneLimiter = rateLimit({
+  windowMs: SMS_OTP_PHONE_WINDOW_MS,
+  max: SMS_OTP_PHONE_MAX,
+  standardHeaders: true,
+  legacyHeaders: false,
+  validate: { xForwardedForHeader: false, forwardedHeader: false, default: false },
+  skip: (req) => !extractSmsOtpPhoneKey(req),
+  keyGenerator: (req) => `phone:${extractSmsOtpPhoneKey(req) || getClientIp(req)}`,
+  message: {
+    success: false,
+    fallbackToFirebase: true,
+    error: "Too many SMS requests for this mobile number. Switching to backup verification."
   }
 });
 
@@ -8645,12 +8670,7 @@ Knowledge Base & Service Details:
   // =========================================================================
   // SERVER-AUTHORITATIVE SESSION ENGINE (HMAC-SHA256 & HTTP-ONLY COOKIES)
   // =========================================================================
-
-  const SERVER_AUTH_SECRET =
-    process.env.SESSION_SECRET ||
-    process.env.SUPABASE_SERVICE_ROLE_KEY ||
-    process.env.JWT_SECRET ||
-    crypto.randomBytes(32).toString("hex");
+  // SERVER_AUTH_SECRET is validated fail-fast at module startup via resolveServerAuthSecret().
 
   interface ServerAuthSession {
     uid: string;
@@ -8933,7 +8953,7 @@ Knowledge Base & Service Details:
    * POST /api/auth/send-phone-otp
    * Request Body: { phone: "9876543210" }
    */
-  app.post("/api/auth/send-phone-otp", smsOtpLimiter, async (req, res) => {
+  app.post("/api/auth/send-phone-otp", smsOtpLimiter, smsOtpPhoneLimiter, async (req, res) => {
     try {
       const rawPhone = (req.body && req.body.phone) || req.query?.phone || "";
       const cleanPhone = String(rawPhone || "").replace(/\D/g, "").slice(-10);
@@ -8961,6 +8981,7 @@ Knowledge Base & Service Details:
         const remainingSec = Math.ceil((5000 - (now - lastSent)) / 1000);
         return res.status(429).json({
           success: false,
+          fallbackToFirebase: true,
           error: `Please wait ${remainingSec} seconds before requesting another verification code.`
         });
       }
@@ -8969,10 +8990,10 @@ Knowledge Base & Service Details:
       const generatedOtp = crypto.randomInt(100000, 1000000).toString();
       const expiresAt = Date.now() + 10 * 60 * 1000;
 
-      // Helper to dispatch via Fast2SMS Dev API v2 with strict timeout
+      // Helper to dispatch via Fast2SMS Dev API v2 with strict 5000ms timeout
       const dispatchFast2Sms = async (payload: Record<string, string>) => {
         const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 8000);
+        const timer = setTimeout(() => controller.abort(), FAST2SMS_DISPATCH_TIMEOUT_MS);
         try {
           const upstream = await fetch("https://www.fast2sms.com/dev/bulkV2", {
             method: "POST",
@@ -8991,40 +9012,25 @@ Knowledge Base & Service Details:
         }
       };
 
-      // Primary route: Fast2SMS dedicated pre-approved DLT 'otp' route (pan-India, DND-safe, 2-5s delivery)
-      let smsResponse = await dispatchFast2Sms({
+      // Strictly use Fast2SMS dedicated pre-approved DLT 'otp' route (pan-India, DND-safe).
+      // No 'q' route fallback (blocked on DND numbers and higher cost); fall back to Firebase on failure.
+      const smsResponse = await dispatchFast2Sms({
         route: "otp",
         variables_values: generatedOtp,
         numbers: cleanPhone,
         flash: "0",
       });
-      let usedRoute: "otp" | "q" = "otp";
+      const usedRoute: "otp" = "otp";
 
-      const primaryStatusCode = Number(smsResponse.data?.status_code || smsResponse.httpStatus || 0);
-      const primaryOk = smsResponse.data?.return === true;
+      const fast2SmsLog = formatFast2SmsResponseLog(smsResponse.data, smsResponse.httpStatus);
+      console.log(
+        `[Fast2SMS OTP] Send response (http=${smsResponse.httpStatus}, ok=${fast2SmsLog.ok}, request_id=${fast2SmsLog.requestId}, message=${fast2SmsLog.message})`
+      );
 
-      // Secondary fallback: Quick SMS 'q' route ONLY if primary failed for a non-auth/non-IP-block reason
-      if (!primaryOk && primaryStatusCode !== 414 && primaryStatusCode !== 411 && primaryStatusCode !== 412) {
-        const webOtpMessage = `${generatedOtp} is your SmartRun verification code. Valid for 10 minutes.\n\n@www.smartrun.in #${generatedOtp}`;
-        const quickRes = await dispatchFast2Sms({
-          route: "q",
-          message: webOtpMessage,
-          language: "english",
-          numbers: cleanPhone,
-          flash: "0",
-        });
-        if (quickRes.data?.return === true) {
-          smsResponse = quickRes;
-          usedRoute = "q";
-        }
-      }
-
-      if (smsResponse.data?.return !== true) {
-        const statusCode = Number(smsResponse.data?.status_code || smsResponse.httpStatus || 502);
-        const providerMsg = Array.isArray(smsResponse.data?.message)
-          ? smsResponse.data.message.join(" ")
-          : String(smsResponse.data?.message || "SMS gateway rejected request.");
-        console.warn(`[Fast2SMS OTP] Delivery failed (code=${statusCode}): ${providerMsg}`);
+      if (!fast2SmsLog.ok) {
+        const statusCode = fast2SmsLog.statusCode;
+        const providerMsg = fast2SmsLog.message || "SMS gateway rejected request.";
+        console.warn(`[Fast2SMS OTP] Delivery failed (code=${statusCode}, request_id=${fast2SmsLog.requestId}): ${providerMsg}`);
         return res.status(502).json({
           success: false,
           fallbackToFirebase: true,
@@ -9065,7 +9071,9 @@ Knowledge Base & Service Details:
         }, { merge: true }).catch(() => {});
       }
 
-      console.log(`[Fast2SMS OTP] Dispatched pan-India SMS (${usedRoute}) to +91 ${cleanPhone.slice(0, 4)}****`);
+      console.log(
+        `[Fast2SMS OTP] Dispatched pan-India SMS (${usedRoute}) to +91 ${cleanPhone.slice(0, 4)}**** (request_id=${fast2SmsLog.requestId})`
+      );
 
       return res.json({
         success: true,
@@ -11573,5 +11581,9 @@ process.on("uncaughtException", (err) => {
 
 startServer().catch((err) => {
   console.error("[DevServer] Fatal error during startServer:", err);
+  const envName = String(process.env.NODE_ENV || "").trim().toLowerCase();
+  if (envName === "production" || envName === "prod") {
+    process.exit(1);
+  }
 });
 

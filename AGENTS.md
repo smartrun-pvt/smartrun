@@ -21,18 +21,28 @@
 
 ## 2. SMS Gateway Architecture & Fast2SMS Error Reference
 
-### Cascaded SMS Gateway
-1. **Primary Gateway**: **Firebase Phone Auth**
-   - Headless reCAPTCHA verifier + SMS OTP.
-2. **Secondary Fallback Gateway**: **Fast2SMS Dev API (bulkV2)**
-   - API Endpoint: `/api/sms/send-fast2sms-otp`
-   - Test Endpoint: `/api/sms/test-fast2sms-otp`
-   - Status Endpoint: `/api/sms/fast2sms-status`
-   - **Primary Route**: Dedicated `otp` route (`variables_values: <otp>`, `route: "otp"`). Uses Fast2SMS pre-approved DLT template, cost is only ~₹0.20 per SMS.
-   - **Secondary Route**: Quick SMS `q` (`route: "q"`, `message: "..."`).
+> ⚠️ **CRITICAL RULE**: **Do not remove the Fast2SMS endpoints or the Firebase fallback.** Both gateways work together to ensure reliable pan-India OTP delivery across the Android APK and website.
+
+### Cascaded Dual-Gateway Phone OTP Flow
+1. **Primary Gateway**: **Fast2SMS Dev API (`bulkV2`) via `POST /api/auth/send-phone-otp`**
+   - **Endpoint**: `POST /api/auth/send-phone-otp` (unified Express route in `server.ts`; legacy `/api/sms/*` routes are retired).
+   - **Route**: Strictly uses Fast2SMS pre-approved DLT `otp` route (`route: "otp"`, `variables_values: <otp>`, `numbers: <clean10>`, `flash: "0"`). The `q` route fallback is intentionally disabled (blocked on DND numbers and higher cost).
+   - **Timeouts & Observability**: Server Fast2SMS dispatch timeout is `5000 ms` (`FAST2SMS_DISPATCH_TIMEOUT_MS`); logs `request_id` and `message` on every send without ever logging the OTP. On any `otp` route failure or timeout, the server returns HTTP `502` with `fallbackToFirebase: true`.
+   - **Rate Limiting**: Protected by `smsOtpLimiter` (`30` requests / `10` min per proxy-verified `req.ip` via `trust proxy: 1`) and `smsOtpPhoneLimiter` (`5` sends / `30` min per normalized 10-digit `req.body.phone`). Both return HTTP `429` with `fallbackToFirebase: true`.
+   - **Client Fallthrough & Abort Tracking**: `sendFirebasePhoneOtp` uses a `12000 ms` client abort timer. HTTP `429`, `5xx`, network errors, and aborts all fall through to Firebase rather than blocking the user. If the client request aborts (outcome unknown), it sets `fastSmsMayHaveSent = true` for that phone before continuing to Firebase.
+2. **Secondary Fallback Gateway**: **Firebase Phone Auth**
+   - **Android APK (Capacitor Native)**: Native Firebase Phone Auth (`@capacitor-firebase/authentication` with Play Integrity, instant verification, and SMS auto-retrieval).
+   - **Website (Browser)**: Firebase Web SDK (`signInWithPhoneNumber` with invisible reCAPTCHA on fresh virgin DOM slots).
+3. **Alternating Provider on Resend (`LoginPage.tsx` + `sendFirebasePhoneOtp`)**:
+   - `sendFirebasePhoneOtp` accepts an optional `forceProvider?: 'fast2sms' | 'firebase'`. When `'firebase'`, it skips `/api/auth/send-phone-otp` and goes straight to native Firebase (APK) or Web Firebase (website).
+   - `LoginPage` tracks `sendAttempt` per phone number and stores the last provider in `otpProvider`. The first send uses the default order (Fast2SMS first, then Firebase fallback). Every **Resend** for the same number alternates to the **other** provider (`'fast2sms'` <-> `'firebase'`) with a 30-second cooldown and a 15-second native slow-send info line.
+4. **Verification (`POST /api/auth/verify-phone-otp` + Firebase Confirmation)**:
+   - **Fast2SMS Verification**: Supports BOTH stateless HMAC-SHA256 verification tokens (`expiresAt.signature`, constant-time verification with single-use replay protection in `consumedOtpTokens`, backed by fail-fast `SERVER_AUTH_SECRET` in production) AND server in-memory `serverPhoneOtpStore` lookup (with 5-attempt lockout).
+   - **Ambiguous-Abort Recovery**: In both `verifyFirebaseOtpAndBridgeToSupabase` and `verifyPhoneOtpOnly`, if Firebase confirmation fails with `auth/invalid-verification-code` and `fastSmsMayHaveSent` is `true` for that phone, the client retries once via `POST /api/auth/verify-phone-otp` with `{ phone, otp }` (no token) against `serverPhoneOtpStore` before surfacing an error.
+   - **Supabase Identity Bridge**: Once verified by either gateway, `bridgeVerifiedPhoneToSupabase` resolves existing accounts via `/api/auth/resolve-phone-user` and provisions/activates the unified Supabase session.
 
 ### Fast2SMS Error Code 414: "IP is blacklisted from Dev API section"
-- **Cause**: Fast2SMS Developer API has an IP security filter. When the API key is called from a cloud server or data center IP (such as Google Cloud egress IP `34.34.254.4`), Fast2SMS rejects the request with HTTP/Status 414: `{"return": false, "status_code": 414, "message": "IP is blacklisted from Dev API section"}`.
+- **Cause**: Fast2SMS Developer API has an IP security filter. When the API key is called from a cloud server or data center IP (such as Google Cloud egress IP `34.34.254.4`), Fast2SMS rejects the request with HTTP/Status 414: `{"return": false, "status_code": 414, "message": "IP is blacklisted from Dev API section"}` (causing `/api/auth/send-phone-otp` to return `502` with `fallbackToFirebase: true`).
 - **How to Resolve in Fast2SMS Dashboard**:
   1. Log in to [Fast2SMS Dashboard](https://www.fast2sms.com/dashboard/dev-api).
   2. Navigate to **Dev API** -> **SECURITY** tab.
@@ -272,14 +282,14 @@
     - Upserts `fcm_token` and `push_token` into Supabase `profiles` table (`onConflict: 'id'`).
     - Syncs token with server endpoint `/api/push/register-token`.
   - **Automated Lifecycle Sync**: Created `syncStoredPushTokenToSupabase` and integrated it across initial session retrieval (`getInitialAuthSession`), login callback (`handleAuthSuccess`), auth listener (`onAuthStateChange`), profile updates (`syncUserProfileToSupabase`), and `userProfile?.id` change effects. Ensures device push tokens are always mapped to user accounts upon login.
-- [x] **Fast2SMS Complete Eradication & Pure Firebase Phone Auth OTP Integration**:
-  - **Complete Removal**: Removed all Fast2SMS endpoints (`/api/sms/send-fast2sms-otp`, `/api/sms/verify-fast2sms-otp`, `/api/sms/fast2sms-status`, `/api/sms/test-fast2sms-otp`), deleted `api/sms/` serverless handlers, removed `FAST2SMS_API_KEY` from `server.ts` and `.env.example`.
-  - **Pure Firebase Phone Auth**: `sendFirebasePhoneOtp` now runs strictly via the official Firebase Web SDK (`signInWithPhoneNumber(firebaseAuth, formattedPhone, appVerifier)` with invisible reCAPTCHA). Verification executes directly via `activeConfirmationResult.confirm(otpCode)`.
-  - **Firebase OTP to Supabase Architecture**:
-    1. **Verification (Firebase Auth)**: User completes OTP via Google Identity Platform (`confirmationResult.confirm(cleanCode)`), yielding a genuine `firebaseUser` with phone number and Firebase UID (`firebaseUser.uid`).
+- [x] **Dual-Gateway Phone OTP Architecture (Fast2SMS Primary + Firebase Phone Auth Fallback & Supabase Bridge)**:
+  - **Unified Express Endpoints (Legacy `/api/sms/*` Retired)**: Replaced legacy Vercel `/api/sms/*` handlers with unified Express routes `POST /api/auth/send-phone-otp` (Fast2SMS DLT `otp`-only route, 5s timeout, dual per-IP & per-phone limiters returning `fallbackToFirebase: true`) and `POST /api/auth/verify-phone-otp` (HMAC-SHA256 `token` + `serverPhoneOtpStore` verification with 5-attempt lockout). **Do not remove the Fast2SMS endpoints or the Firebase fallback.**
+  - **Cascaded Delivery & Resend Alternation**: `sendFirebasePhoneOtp` attempts Fast2SMS (`/api/auth/send-phone-otp`) first with a 12s client abort timer, falling through to native Firebase Phone Auth on the Android APK (`@capacitor-firebase/authentication`) or Firebase Web SDK (`signInWithPhoneNumber`) on the website on HTTP `429`, `5xx`, or timeout/abort (`fastSmsMayHaveSent = true`). On every **Resend** for the same number, `LoginPage` alternates `forceProvider` between `'fast2sms'` and `'firebase'` (30s cooldown, 15s native slow-send notice).
+  - **Verification & Supabase Account Bridging**:
+    1. **Verification**: Fast2SMS codes verify via `POST /api/auth/verify-phone-otp` (HMAC token or `serverPhoneOtpStore`); Firebase codes confirm via native `confirmVerificationCode` or web `confirmationResult.confirm` (with a single `{ phone, otp }` retry to `/api/auth/verify-phone-otp` on `auth/invalid-verification-code` when `fastSmsMayHaveSent` is true).
     2. **Pre-Resolution**: System checks `/api/auth/resolve-phone-user` to find if this phone already has an existing account/profile in Supabase (from previous email logins or orders).
     3. **Canonical Identity Creation & Sign-In**: Supabase signs into or signs up a canonical account for the phone number (`p${clean10}@girirajpower.internal`).
-    4. **Identity & Metadata Merging**: Attaches `firebase_uid: firebaseUser.uid`, phone number, and full name into Supabase Auth user metadata (`supabase.auth.updateUser`) and syncs with Supabase `user_profiles`.
+    4. **Identity & Metadata Merging**: Attaches `firebase_uid` (when present), phone number, and full name into Supabase Auth user metadata (`supabase.auth.updateUser`) and syncs with Supabase `user_profiles`.
     5. **Session Activation**: Sets active session in `supabase.auth.setSession`, giving the user instant access to all Supabase PostgreSQL tables (orders, cart, profiles, addresses).
 - [x] **Vite Connect, Firestore Connect in Log, & White Blank Page Resolution**:
   - **Root Cause 1 ("vite connect" in log)**: Vite development server attempts WebSocket connection (`[vite] connecting...`) for HMR. In AI Studio's sandboxed iframe and reverse proxy environment, WebSocket connections fail harmlessly. Added custom filtering to silence benign `[vite] connecting...` and `failed to connect to websocket` notices in `index.html`.
@@ -324,10 +334,10 @@
   - **Resilient Fallback Tracking**: While billing is pending, delivery tracking displays an advisory banner with direct billing link and renders the map on standard OpenStreetMap tiles (`https://tile.openstreetmap.org/{z}/{x}/{y}.png`, zero Carto CDN) with all custom markers, live OSRM road polyline, recenter button, and GPS badge. As soon as billing is linked in Google Cloud Console, Google Maps vector map activates immediately.
 - [x] **Map Controls Clean-up (Location Modal)**:
   - Removed Zoom In button (`#floating-zoom-in-btn`), Zoom Out button (`#floating-zoom-out-btn`), and top floating "Detect My Current Location" button (`#map-detect-current-location-pill`) from over the map canvas in `LocationModal.tsx`, leaving a clean, unobstructed map view.
-- [x] **Removal of Unused Services (Render, Fast2SMS, Vercel) & Google Cloud Run Readiness**:
-  - **Vercel Removal**: Completely removed `vercel.json` and deleted `/api` directory (which contained legacy Vercel serverless functions). All endpoints (`/api/razorpay/*`, `/sitemap.xml`, etc.) are natively served by the unified Express server in `server.ts`.
+- [x] **Removal of Legacy Platforms (Render & Vercel) & Google Cloud Run Readiness**:
+  - **Vercel Removal**: Completely removed `vercel.json` and deleted `/api` directory (which contained legacy Vercel serverless functions including `/api/sms/*`). All endpoints (`/api/auth/*`, `/api/razorpay/*`, `/sitemap.xml`, etc.) are natively served by the unified Express server in `server.ts`.
   - **Render Removal**: Removed Render keep-alive loops (`RENDER_EXTERNAL_URL`, `X-Render-Keep-Alive`) in `server.ts`, removed `render` flag from `/api/health`, and removed `pingRenderKeepAlive()` / `startRenderKeepAlive()` from `src/lib/apiBase.ts` and `src/App.tsx`.
-  - **Fast2SMS Verification**: Verified full removal of Fast2SMS code and endpoints; auth uses pure official Firebase Phone Auth.
+  - **Dual-Gateway OTP Continuity**: Fast2SMS OTP delivery runs natively inside `server.ts` at `/api/auth/send-phone-otp` and `/api/auth/verify-phone-otp`, backed by Firebase Phone Auth fallback (native SDK on APK, Web SDK on web). Do not remove either gateway.
   - **Bug Fix**: Fixed `OsmProvider.ts` TypeScript error by adding optional `onClick?: (coords: MapCoordinates) => void;` to `MapInitOptions` in `src/services/maps/types.ts`.
   - **Google Cloud Run Verification**:
     - Container listens on `0.0.0.0` and dynamic `$PORT` (default 8080).
