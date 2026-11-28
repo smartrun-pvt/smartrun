@@ -22,6 +22,12 @@ import {
   resolveNextOtpProvider,
   shouldStopOnFastSmsResponse,
   shouldRetryFast2SmsVerifyAfterFirebaseFailure,
+  DEFAULT_INVISIBLE_RECAPTCHA_CONTAINER_ID,
+  DEFAULT_VISIBLE_RECAPTCHA_CONTAINER_ID,
+  resolveRecaptchaContainerId,
+  shouldEscalateToVisibleRecaptcha,
+  canSubmitWithVisibleRecaptcha,
+  resolveEffectiveForceProviderForCaptcha,
 } from './firebaseAuthDomain';
 import { extractOtpDigits } from './otpAutofill';
 import { resolveWebAuthnRpConfig } from './passkeyHelper';
@@ -335,6 +341,117 @@ test('OTP reliability policy: provider alternation, 429 fallthrough, timers, and
       targetPhone: '+919876543219',
     }),
     false
+  );
+});
+
+test('Dual-mode Firebase reCAPTCHA policy: isolated containers, visible gating, escalation, and provider selection', () => {
+  // Hidden and visible containers stay strictly isolated
+  assert.equal(
+    resolveRecaptchaContainerId('invisible'),
+    DEFAULT_INVISIBLE_RECAPTCHA_CONTAINER_ID
+  );
+  assert.equal(
+    resolveRecaptchaContainerId('visible'),
+    DEFAULT_VISIBLE_RECAPTCHA_CONTAINER_ID
+  );
+  assert.equal(
+    resolveRecaptchaContainerId('visible', DEFAULT_INVISIBLE_RECAPTCHA_CONTAINER_ID),
+    DEFAULT_VISIBLE_RECAPTCHA_CONTAINER_ID
+  );
+  assert.equal(
+    resolveRecaptchaContainerId('visible', 'custom-visible-host'),
+    'custom-visible-host'
+  );
+
+  // Visible mode on web gates submission until user ticks captcha; hidden mode and native APK proceed directly
+  assert.equal(
+    canSubmitWithVisibleRecaptcha({ captchaMode: 'invisible', captchaStatus: 'idle', isNativePlatform: false }),
+    true
+  );
+  assert.equal(
+    canSubmitWithVisibleRecaptcha({ captchaMode: 'visible', captchaStatus: 'ready', isNativePlatform: false }),
+    false
+  );
+  assert.equal(
+    canSubmitWithVisibleRecaptcha({ captchaMode: 'visible', captchaStatus: 'expired', isNativePlatform: false }),
+    false
+  );
+  assert.equal(
+    canSubmitWithVisibleRecaptcha({ captchaMode: 'visible', captchaStatus: 'verified', isNativePlatform: false }),
+    true
+  );
+  assert.equal(
+    canSubmitWithVisibleRecaptcha({ captchaMode: 'visible', captchaStatus: 'idle', isNativePlatform: true }),
+    true
+  );
+
+  // Escalates from hidden -> visible on web captcha failures, never on native or domain/quota errors
+  assert.equal(
+    shouldEscalateToVisibleRecaptcha({
+      errorCode: 'auth/captcha-check-failed',
+      currentMode: 'invisible',
+      isNativePlatform: false,
+    }),
+    true
+  );
+  assert.equal(
+    shouldEscalateToVisibleRecaptcha({
+      errorCode: 'auth/network-request-failed',
+      errorMessage: 'Verification timed out waiting for Google reCAPTCHA / Firebase SMS.',
+      currentMode: 'invisible',
+      isNativePlatform: false,
+    }),
+    true
+  );
+  assert.equal(
+    shouldEscalateToVisibleRecaptcha({
+      errorCode: 'auth/captcha-check-failed',
+      currentMode: 'visible',
+      isNativePlatform: false,
+    }),
+    false
+  );
+  assert.equal(
+    shouldEscalateToVisibleRecaptcha({
+      errorCode: 'auth/captcha-check-failed',
+      currentMode: 'invisible',
+      isNativePlatform: true,
+    }),
+    false
+  );
+  assert.equal(
+    shouldEscalateToVisibleRecaptcha({
+      errorCode: 'auth/unauthorized-domain',
+      currentMode: 'invisible',
+      isNativePlatform: false,
+    }),
+    false
+  );
+
+  // Visible captcha mode enforces Firebase verification; hidden mode preserves default/alternating provider
+  assert.equal(
+    resolveEffectiveForceProviderForCaptcha({
+      baseForceProvider: undefined,
+      captchaMode: 'invisible',
+      isNativePlatform: false,
+    }),
+    undefined
+  );
+  assert.equal(
+    resolveEffectiveForceProviderForCaptcha({
+      baseForceProvider: 'fast2sms',
+      captchaMode: 'invisible',
+      isNativePlatform: false,
+    }),
+    'fast2sms'
+  );
+  assert.equal(
+    resolveEffectiveForceProviderForCaptcha({
+      baseForceProvider: undefined,
+      captchaMode: 'visible',
+      isNativePlatform: false,
+    }),
+    'firebase'
   );
 });
 

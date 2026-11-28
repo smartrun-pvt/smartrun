@@ -36,7 +36,12 @@ import {
   FAST_SMS_ABORT_TIMEOUT_MS,
   shouldStopOnFastSmsResponse,
   shouldRetryFast2SmsVerifyAfterFirebaseFailure,
-  type OtpProvider
+  DEFAULT_INVISIBLE_RECAPTCHA_CONTAINER_ID,
+  DEFAULT_VISIBLE_RECAPTCHA_CONTAINER_ID,
+  resolveRecaptchaContainerId,
+  type OtpProvider,
+  type RecaptchaDisplayMode,
+  type RecaptchaWidgetStatus
 } from '../utils/firebaseAuthDomain';
 import {
   getNativePendingPhoneVerification,
@@ -83,8 +88,11 @@ let activeRecaptchaVerifier: RecaptchaVerifier | null = null;
 let activeRecaptchaAuthInstance: ReturnType<typeof getAuth> | null = null;
 let activeRecaptchaRenderPromise: Promise<number> | null = null;
 let activeRecaptchaConsumed = false;
-let activeRecaptchaHostId = 'recaptcha-container';
+let activeRecaptchaHostId = DEFAULT_INVISIBLE_RECAPTCHA_CONTAINER_ID;
+let activeRecaptchaSize: 'invisible' | 'normal' = 'invisible';
+let activeRecaptchaVerified = false;
 let recaptchaSlotSeq = 0;
+let recaptchaRenderSeq = 0;
 let activeSendRequestSeq = 0;
 let lastSentPhoneNumber: string | null = null;
 let activeBackendOtpToken: string | null = null;
@@ -399,12 +407,16 @@ export function formatFirebasePhoneError(err: any): FirebaseDiagnostic {
  * Clears and resets reCAPTCHA instance and removes any rendered child slot nodes
  * so Google reCAPTCHA never encounters a previously rendered DOM element.
  */
-export function resetRecaptchaVerifier(containerId = activeRecaptchaHostId): void {
+export function resetRecaptchaVerifier(containerId?: string): void {
+  const targetHostId = containerId || activeRecaptchaHostId;
   const prevVerifier = activeRecaptchaVerifier;
   activeRecaptchaVerifier = null;
   activeRecaptchaAuthInstance = null;
   activeRecaptchaRenderPromise = null;
   activeRecaptchaConsumed = false;
+  activeRecaptchaSize = 'invisible';
+  activeRecaptchaVerified = false;
+  recaptchaRenderSeq += 1;
 
   try {
     if (prevVerifier) {
@@ -416,12 +428,21 @@ export function resetRecaptchaVerifier(containerId = activeRecaptchaHostId): voi
 
   if (typeof window !== 'undefined') {
     try {
-      const container = document.getElementById(containerId);
-      if (container) {
-        container.replaceChildren();
-        container.style.display = 'block';
-        container.style.visibility = 'visible';
+      const hostIdsToClear = new Set<string>([targetHostId]);
+      if (!containerId) {
+        hostIdsToClear.add(DEFAULT_INVISIBLE_RECAPTCHA_CONTAINER_ID);
+        hostIdsToClear.add(DEFAULT_VISIBLE_RECAPTCHA_CONTAINER_ID);
       }
+      hostIdsToClear.forEach((id) => {
+        const container = document.getElementById(id);
+        if (container) {
+          container.replaceChildren();
+          if (id === DEFAULT_INVISIBLE_RECAPTCHA_CONTAINER_ID) {
+            container.style.display = 'block';
+            container.style.visibility = 'visible';
+          }
+        }
+      });
       // Soft-hide any lingering reCAPTCHA challenge wrapper overlays without mutating
       // display or pointerEvents, which Google reCAPTCHA's reused bframe overlay does
       // not restore on subsequent challenges.
@@ -440,8 +461,12 @@ export function resetRecaptchaVerifier(containerId = activeRecaptchaHostId): voi
 /**
  * Allocates a brand-new virgin child <div> slot inside the host container so
  * grecaptcha.render() NEVER sees a previously rendered DOM node.
+ * Supports both hidden ('invisible') and inline visible ('normal') containers.
  */
-function createFreshRecaptchaSlot(containerId: string): HTMLDivElement {
+function createFreshRecaptchaSlot(
+  containerId: string,
+  size: 'invisible' | 'normal' = 'invisible'
+): HTMLDivElement {
   activeRecaptchaHostId = containerId;
   let hostEl = document.getElementById(containerId);
   if (!hostEl) {
@@ -450,45 +475,74 @@ function createFreshRecaptchaSlot(containerId: string): HTMLDivElement {
     document.body.appendChild(hostEl);
   }
   hostEl.replaceChildren();
-  hostEl.style.position = 'fixed';
-  hostEl.style.bottom = '0';
-  hostEl.style.right = '0';
-  hostEl.style.width = '0';
-  hostEl.style.height = '0';
-  hostEl.style.overflow = 'hidden';
-  hostEl.style.opacity = '0';
-  hostEl.style.pointerEvents = 'none';
-  hostEl.style.zIndex = '-1';
-  hostEl.style.display = 'block';
-  hostEl.style.visibility = 'visible';
+
+  if (size === 'normal') {
+    hostEl.style.position = 'relative';
+    hostEl.style.bottom = 'auto';
+    hostEl.style.right = 'auto';
+    hostEl.style.width = '100%';
+    hostEl.style.height = 'auto';
+    hostEl.style.overflow = 'visible';
+    hostEl.style.opacity = '1';
+    hostEl.style.pointerEvents = 'auto';
+    hostEl.style.zIndex = '1';
+    hostEl.style.display = 'flex';
+    hostEl.style.justifyContent = 'center';
+    hostEl.style.alignItems = 'center';
+    hostEl.style.visibility = 'visible';
+  } else {
+    hostEl.style.position = 'fixed';
+    hostEl.style.bottom = '0';
+    hostEl.style.right = '0';
+    hostEl.style.width = '0';
+    hostEl.style.height = '0';
+    hostEl.style.overflow = 'hidden';
+    hostEl.style.opacity = '0';
+    hostEl.style.pointerEvents = 'none';
+    hostEl.style.zIndex = '-1';
+    hostEl.style.display = 'block';
+    hostEl.style.visibility = 'visible';
+  }
 
   const slotEl = document.createElement('div');
   slotEl.id = buildRecaptchaSlotId(containerId, ++recaptchaSlotSeq);
   slotEl.dataset.recaptchaSlot = 'true';
+  slotEl.dataset.recaptchaSize = size;
   hostEl.appendChild(slotEl);
   return slotEl;
 }
 
+export interface RecaptchaVerifierOptions {
+  size?: 'invisible' | 'normal';
+  onVerified?: (token: string) => void;
+  onExpired?: () => void;
+  onError?: (err: unknown) => void;
+}
+
 /**
- * Prepares the RecaptchaVerifier on a fresh virgin child DOM slot (invisible by default).
+ * Prepares the RecaptchaVerifier on a fresh virgin child DOM slot (invisible or visible normal box).
  * Never reuses a consumed or previously rendered DOM node, eliminating
  * "reCAPTCHA has already been rendered in this element".
  */
 export function getOrCreateRecaptchaVerifier(
-  containerId = 'recaptcha-container',
+  containerId = DEFAULT_INVISIBLE_RECAPTCHA_CONTAINER_ID,
   authInstance: ReturnType<typeof getAuth> = firebaseAuth,
-  forceFresh = false
+  forceFresh = false,
+  options?: RecaptchaVerifierOptions
 ): RecaptchaVerifier {
   if (typeof window === 'undefined') {
     throw new Error('RecaptchaVerifier requires a browser window environment.');
   }
+
+  const requestedSize: 'invisible' | 'normal' = options?.size || 'invisible';
 
   if (
     !forceFresh &&
     activeRecaptchaVerifier &&
     !activeRecaptchaConsumed &&
     activeRecaptchaAuthInstance === authInstance &&
-    activeRecaptchaHostId === containerId
+    activeRecaptchaHostId === containerId &&
+    activeRecaptchaSize === requestedSize
   ) {
     const hostEl = document.getElementById(containerId);
     if (hostEl && hostEl.querySelector('[data-recaptcha-slot="true"]')) {
@@ -497,37 +551,172 @@ export function getOrCreateRecaptchaVerifier(
   }
 
   resetRecaptchaVerifier(containerId);
-  const slotEl = createFreshRecaptchaSlot(containerId);
+  const slotEl = createFreshRecaptchaSlot(containerId, requestedSize);
 
   activeRecaptchaAuthInstance = authInstance;
   activeRecaptchaConsumed = false;
-  activeRecaptchaVerifier = new RecaptchaVerifier(authInstance, slotEl, {
-    size: 'invisible',
-    callback: () => {
-      console.log('[Firebase Auth] Invisible reCAPTCHA verification passed');
+  activeRecaptchaSize = requestedSize;
+  activeRecaptchaVerified = false;
+
+  const verifier = new RecaptchaVerifier(authInstance, slotEl, {
+    size: requestedSize,
+    callback: (token: string) => {
+      if (activeRecaptchaVerifier !== verifier) return;
+      activeRecaptchaVerified = true;
+      console.log(`[Firebase Auth] ${requestedSize === 'normal' ? 'Visible' : 'Invisible'} reCAPTCHA verification passed`);
+      try {
+        options?.onVerified?.(token);
+      } catch {}
     },
     'expired-callback': () => {
-      console.warn('[Firebase Auth] Invisible reCAPTCHA expired, resetting...');
-      resetRecaptchaVerifier(containerId);
+      if (activeRecaptchaVerifier !== verifier) return;
+      activeRecaptchaVerified = false;
+      console.warn(`[Firebase Auth] ${requestedSize === 'normal' ? 'Visible' : 'Invisible'} reCAPTCHA expired`);
+      try {
+        options?.onExpired?.();
+      } catch {}
+      if (requestedSize === 'invisible') {
+        resetRecaptchaVerifier(containerId);
+      }
+    },
+    'error-callback': (err: unknown) => {
+      if (activeRecaptchaVerifier !== verifier) return;
+      activeRecaptchaVerified = false;
+      console.warn(`[Firebase Auth] ${requestedSize === 'normal' ? 'Visible' : 'Invisible'} reCAPTCHA widget error:`, err);
+      try {
+        options?.onError?.(err);
+      } catch {}
     }
   });
 
-  return activeRecaptchaVerifier;
+  activeRecaptchaVerifier = verifier;
+  return verifier;
+}
+
+/**
+ * Returns true if the inline visible Firebase reCAPTCHA box has been solved and is ready to be consumed.
+ */
+export function isVisibleRecaptchaVerified(
+  containerId = DEFAULT_VISIBLE_RECAPTCHA_CONTAINER_ID
+): boolean {
+  return Boolean(
+    activeRecaptchaVerifier &&
+      !activeRecaptchaConsumed &&
+      activeRecaptchaSize === 'normal' &&
+      activeRecaptchaHostId === containerId &&
+      activeRecaptchaVerified
+  );
+}
+
+/**
+ * Renders the visible inline Firebase reCAPTCHA ("I'm not a robot") box inside the login card
+ * while keeping the hidden invisible container intact for instant toggling between modes.
+ */
+export async function renderVisibleRecaptchaVerifier(
+  containerId = DEFAULT_VISIBLE_RECAPTCHA_CONTAINER_ID,
+  callbacks?: {
+    onStatusChange?: (status: RecaptchaWidgetStatus, errorMessage?: string) => void;
+    onVerified?: (token: string) => void;
+    onExpired?: () => void;
+  }
+): Promise<{ rendered: boolean; error?: string }> {
+  if (typeof window === 'undefined' || Capacitor.isNativePlatform()) {
+    return { rendered: false };
+  }
+
+  const hostEl = document.getElementById(containerId);
+  if (!hostEl) {
+    callbacks?.onStatusChange?.('error', 'Captcha container is not mounted yet.');
+    return { rendered: false, error: 'Captcha container is not mounted yet.' };
+  }
+
+  callbacks?.onStatusChange?.('loading');
+
+  const tryRenderWithAuth = async (authInstance: ReturnType<typeof getAuth>) => {
+    const verifier = getOrCreateRecaptchaVerifier(containerId, authInstance, true, {
+      size: 'normal',
+      onVerified: (token) => {
+        if (activeRecaptchaVerifier !== verifier) return;
+        callbacks?.onStatusChange?.('verified');
+        callbacks?.onVerified?.(token);
+      },
+      onExpired: () => {
+        if (activeRecaptchaVerifier !== verifier) return;
+        callbacks?.onStatusChange?.('expired', 'Captcha expired. Please verify again.');
+        callbacks?.onExpired?.();
+      },
+      onError: () => {
+        if (activeRecaptchaVerifier !== verifier) return;
+        callbacks?.onStatusChange?.('error', 'Unable to verify captcha. Please reload and try again.');
+      }
+    });
+    const seq = recaptchaRenderSeq;
+
+    const renderPromise = verifier.render();
+    activeRecaptchaRenderPromise = renderPromise;
+    await renderPromise;
+
+    if (activeRecaptchaRenderPromise === renderPromise) {
+      activeRecaptchaRenderPromise = null;
+    }
+    if (seq !== recaptchaRenderSeq || activeRecaptchaVerifier !== verifier) {
+      return { rendered: false };
+    }
+
+    callbacks?.onStatusChange?.(activeRecaptchaVerified ? 'verified' : 'ready');
+    return { rendered: true };
+  };
+
+  try {
+    return await tryRenderWithAuth(firebaseAuth);
+  } catch (primaryErr: unknown) {
+    const canFallback = shouldAllowFallbackFirebaseAuthDomain({
+      isNativePlatform: Capacitor.isNativePlatform(),
+      windowHostname: typeof window !== 'undefined' ? window.location.hostname : '',
+    });
+
+    if (canFallback && resolvedFirebaseConfig.authDomain !== firebaseConfig.authDomain) {
+      try {
+        return await tryRenderWithAuth(getFallbackFirebaseAuth());
+      } catch (fallbackErr: unknown) {
+        const diag = formatFirebasePhoneError(fallbackErr);
+        callbacks?.onStatusChange?.('error', diag.userMessage || 'Unable to load Firebase captcha.');
+        return { rendered: false, error: diag.userMessage };
+      }
+    }
+
+    const diag = formatFirebasePhoneError(primaryErr);
+    callbacks?.onStatusChange?.('error', diag.userMessage || 'Unable to load Firebase captcha.');
+    return { rendered: false, error: diag.userMessage };
+  }
 }
 
 /**
  * Pre-warms invisible reCAPTCHA on Web browsers while the user types their mobile number,
- * shaving 2-5 seconds off OTP send latency on mobile networks. No-op on native APK.
+ * shaving 2-5 seconds off OTP send latency on mobile networks. No-op on native APK or when
+ * the visible captcha box is currently active.
  * Serialized via activeRecaptchaRenderPromise so clicking "Get OTP" never races render().
  */
-export function prewarmRecaptchaVerifier(containerId = 'recaptcha-container'): void {
+export function prewarmRecaptchaVerifier(
+  containerId = DEFAULT_INVISIBLE_RECAPTCHA_CONTAINER_ID
+): void {
   if (typeof window === 'undefined' || Capacitor.isNativePlatform()) return;
   try {
     if (activeRecaptchaRenderPromise) return;
-    if (activeRecaptchaVerifier && !activeRecaptchaConsumed && activeRecaptchaAuthInstance === firebaseAuth) {
+    if (activeRecaptchaVerifier && !activeRecaptchaConsumed && activeRecaptchaSize === 'normal') {
       return;
     }
-    const verifier = getOrCreateRecaptchaVerifier(containerId, firebaseAuth, true);
+    if (
+      activeRecaptchaVerifier &&
+      !activeRecaptchaConsumed &&
+      activeRecaptchaSize === 'invisible' &&
+      activeRecaptchaAuthInstance === firebaseAuth
+    ) {
+      return;
+    }
+    const verifier = getOrCreateRecaptchaVerifier(containerId, firebaseAuth, true, {
+      size: 'invisible'
+    });
     const renderPromise = verifier
       .render()
       .catch(() => {
@@ -560,6 +749,7 @@ export interface SendFirebaseOtpResult {
 export interface SendFirebaseOtpCallbacks {
   purpose?: 'login' | 'profile_update';
   forceProvider?: OtpProvider;
+  recaptchaMode?: RecaptchaDisplayMode;
   onAutoFillOtp?: (code: string) => void;
   onNativeVerificationCompleted?: (result: VerifyFirebaseOtpResult) => void;
 }
@@ -910,8 +1100,13 @@ export async function sendFirebasePhoneOtp(
     }
   }
 
-  // 2. Web Firebase Phone Auth SDK (Direct Google Firebase SMS Dispatch via invisible reCAPTCHA)
-  const WEB_OTP_SEND_TIMEOUT_MS = 35000;
+  // 2. Web Firebase Phone Auth SDK (Supports BOTH hidden invisible reCAPTCHA & visible inline captcha box)
+  const effectiveRecaptchaMode: RecaptchaDisplayMode = callbacks?.recaptchaMode || 'invisible';
+  const targetContainerId = resolveRecaptchaContainerId(effectiveRecaptchaMode, containerId);
+  const requestedRecaptchaSize: 'invisible' | 'normal' =
+    effectiveRecaptchaMode === 'visible' ? 'normal' : 'invisible';
+  const WEB_OTP_SEND_TIMEOUT_MS = effectiveRecaptchaMode === 'visible' ? 90000 : 35000;
+
   const attemptWebFirebaseSend = async (
     authInstance: ReturnType<typeof getAuth>,
     forceFresh = false
@@ -919,9 +1114,17 @@ export async function sendFirebasePhoneOtp(
     if (!forceFresh && activeRecaptchaRenderPromise && activeRecaptchaAuthInstance === authInstance) {
       await activeRecaptchaRenderPromise.catch(() => {});
     }
-    const appVerifier = getOrCreateRecaptchaVerifier(containerId, authInstance, forceFresh);
+    const appVerifier = getOrCreateRecaptchaVerifier(
+      targetContainerId,
+      authInstance,
+      forceFresh,
+      { size: requestedRecaptchaSize }
+    );
     activeRecaptchaConsumed = true;
-    console.log(`[Firebase Phone Auth] Requesting Web SDK OTP dispatch for ${formattedPhone}...`);
+    activeRecaptchaVerified = false;
+    console.log(
+      `[Firebase Phone Auth] Requesting Web SDK OTP dispatch (${effectiveRecaptchaMode} reCAPTCHA) for ${formattedPhone}...`
+    );
 
     let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
     const confirmationResult = await Promise.race([
@@ -956,20 +1159,32 @@ export async function sendFirebasePhoneOtp(
     };
   };
 
+  // When a visible captcha widget was already solved using the fallback dev authDomain,
+  // use that exact auth instance so signInWithPhoneNumber consumes the verified token directly.
+  const primaryWebAuthInstance =
+    effectiveRecaptchaMode === 'visible' &&
+    activeRecaptchaVerifier &&
+    !activeRecaptchaConsumed &&
+    activeRecaptchaSize === 'normal' &&
+    activeRecaptchaHostId === targetContainerId &&
+    activeRecaptchaAuthInstance
+      ? activeRecaptchaAuthInstance
+      : firebaseAuth;
+
   try {
-    return await attemptWebFirebaseSend(firebaseAuth, false);
+    return await attemptWebFirebaseSend(primaryWebAuthInstance, false);
   } catch (webErr: any) {
     console.warn('[Firebase Phone Auth] Web SDK primary attempt failed:', webErr);
-    resetRecaptchaVerifier(containerId);
+    resetRecaptchaVerifier(targetContainerId);
 
     // Self-heal immediately if a stale/prewarmed widget threw "already been rendered in this element"
     if (isRecaptchaAlreadyRenderedError(webErr)) {
       try {
         console.log('[Firebase Phone Auth] Retrying Web SDK OTP on a brand-new virgin reCAPTCHA slot...');
-        return await attemptWebFirebaseSend(firebaseAuth, true);
+        return await attemptWebFirebaseSend(primaryWebAuthInstance, true);
       } catch (freshErr: any) {
         webErr = freshErr;
-        resetRecaptchaVerifier(containerId);
+        resetRecaptchaVerifier(targetContainerId);
       }
     }
 
@@ -994,6 +1209,7 @@ export async function sendFirebasePhoneOtp(
     if (
       canFallbackAuthDomain &&
       isDomainOrCaptchaErr &&
+      primaryWebAuthInstance !== getFallbackFirebaseAuth() &&
       resolvedFirebaseConfig.authDomain !== firebaseConfig.authDomain
     ) {
       try {
@@ -1001,7 +1217,7 @@ export async function sendFirebasePhoneOtp(
         return await attemptWebFirebaseSend(getFallbackFirebaseAuth(), true);
       } catch (retryErr: any) {
         console.warn('[Firebase Phone Auth] Fallback authDomain retry also failed:', retryErr);
-        resetRecaptchaVerifier(containerId);
+        resetRecaptchaVerifier(targetContainerId);
         const retryDiag = formatFirebasePhoneError(retryErr);
         return {
           success: false,

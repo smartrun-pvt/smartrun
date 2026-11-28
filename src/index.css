@@ -375,6 +375,21 @@ button[aria-label^="Previous product image"] {
   z-index: -1;
 }
 
+/* Inline visible Firebase reCAPTCHA box host present alongside hidden #recaptcha-container */
+#login-visible-recaptcha-container {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  min-height: 78px;
+}
+
+#login-visible-recaptcha-container > div {
+  display: flex;
+  justify-content: center;
+}
+
 /* Delivery Motorcycle & Gate Button Animations */
 @keyframes bike-idle {
   0%, 100% {

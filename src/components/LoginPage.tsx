@@ -15,7 +15,8 @@ import {
   ChevronLeft,
   ShieldCheck,
   Fingerprint,
-  Loader2
+  Loader2,
+  RefreshCw
 } from 'lucide-react';
 import { Capacitor } from '@capacitor/core';
 import {
@@ -43,6 +44,8 @@ import {
   formatToE164Phone,
   resetRecaptchaVerifier,
   prewarmRecaptchaVerifier,
+  renderVisibleRecaptchaVerifier,
+  isVisibleRecaptchaVerified,
   getPendingPhoneOtpSession,
   clearPendingPhoneOtpSession
 } from '../services/firebaseAuthService';
@@ -63,7 +66,14 @@ import {
   resolveNextOtpProvider,
   NATIVE_SLOW_SEND_NOTICE_MS,
   NATIVE_SLOW_SEND_INFO_MESSAGE,
-  OTP_RESEND_COOLDOWN_SECONDS
+  OTP_RESEND_COOLDOWN_SECONDS,
+  DEFAULT_INVISIBLE_RECAPTCHA_CONTAINER_ID,
+  DEFAULT_VISIBLE_RECAPTCHA_CONTAINER_ID,
+  shouldEscalateToVisibleRecaptcha,
+  canSubmitWithVisibleRecaptcha,
+  resolveEffectiveForceProviderForCaptcha,
+  type RecaptchaDisplayMode,
+  type RecaptchaWidgetStatus
 } from '../utils/firebaseAuthDomain';
 
 interface LoginPageProps {
@@ -159,6 +169,13 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
   const [otpProvider, setOtpProvider] = useState<'firebase' | 'fast2sms' | null>(null);
   const [sendAttempt, setSendAttempt] = useState(0);
   const [showSecondField, setShowSecondField] = useState(false);
+
+  // Hybrid Firebase Device Verification Captcha (both hidden #recaptcha-container & visible iframe host present together)
+  const [captchaMode, setCaptchaMode] = useState<RecaptchaDisplayMode>('visible');
+  const [captchaStatus, setCaptchaStatus] = useState<RecaptchaWidgetStatus>('idle');
+  const [captchaError, setCaptchaError] = useState<string | null>(null);
+  const [captchaHighlight, setCaptchaHighlight] = useState(false);
+  const [captchaMountNonce, setCaptchaMountNonce] = useState(0);
 
   // Onboarding for New User via Phone OTP
   const [onboardingPhone, setOnboardingPhone] = useState('');
@@ -335,6 +352,66 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
       stopNativeSmsOtpAutofill();
     };
   }, []);
+
+  // Sync dual-mode Firebase reCAPTCHA lifecycle:
+  // - When visible mode is active on web phone login (pre-OTP), mount the inline "I'm not a robot" box.
+  // - When hidden mode is active, cleanly reset the visible slot and keep hidden invisible reCAPTCHA ready.
+  const isPhonePrimaryPreOtp = authStep === 'primary' && isPhoneInput(identifier) && !otpSent;
+
+  useEffect(() => {
+    if (isCapacitorNative) {
+      return;
+    }
+
+    if (!isPhonePrimaryPreOtp) {
+      if (captchaStatus !== 'idle') {
+        setCaptchaStatus('idle');
+        setCaptchaError(null);
+        setCaptchaHighlight(false);
+      }
+      return;
+    }
+
+    if (captchaMode === 'visible') {
+      let cancelled = false;
+      setCaptchaError(null);
+      setCaptchaHighlight(false);
+
+      const frameId = window.requestAnimationFrame(() => {
+        if (cancelled) return;
+        renderVisibleRecaptchaVerifier(DEFAULT_VISIBLE_RECAPTCHA_CONTAINER_ID, {
+          onStatusChange: (status, errMsg) => {
+            if (cancelled) return;
+            setCaptchaStatus(status);
+            if (status === 'verified') {
+              setCaptchaError(null);
+              setCaptchaHighlight(false);
+              setError((prev) =>
+                prev && prev.toLowerCase().includes('captcha') ? null : prev
+              );
+            } else if (errMsg) {
+              setCaptchaError(errMsg);
+            }
+          }
+        }).catch(() => {});
+      });
+
+      return () => {
+        cancelled = true;
+        window.cancelAnimationFrame(frameId);
+      };
+    }
+
+    // Hidden (invisible) mode: release visible widget slot and prewarm hidden verifier
+    resetRecaptchaVerifier(DEFAULT_VISIBLE_RECAPTCHA_CONTAINER_ID);
+    setCaptchaStatus('idle');
+    setCaptchaError(null);
+    setCaptchaHighlight(false);
+    const digits = identifier.replace(/[^0-9]/g, '');
+    if (digits.length >= 6) {
+      prewarmRecaptchaVerifier(DEFAULT_INVISIBLE_RECAPTCHA_CONTAINER_ID);
+    }
+  }, [isCapacitorNative, isPhonePrimaryPreOtp, captchaMode, captchaMountNonce]);
 
   // Intercept Android hardware back while OTP entry, loading, or onboarding is active
   // so pressing Back returns cleanly to phone entry instead of calling CapApp.exitApp().
@@ -846,12 +923,38 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
       return;
     }
     const clean10 = parsedPhone.clean10;
+    const isResendAttempt = otpSent && showSecondField;
+    const effectiveCaptchaMode: RecaptchaDisplayMode = isResendAttempt ? 'invisible' : captchaMode;
+
+    // In Visible Captcha mode on web, require the user to solve the inline "I'm not a robot" box first
+    const resolvedCaptchaStatus: RecaptchaWidgetStatus =
+      effectiveCaptchaMode === 'visible' && !isCapacitorNative && isVisibleRecaptchaVerified(DEFAULT_VISIBLE_RECAPTCHA_CONTAINER_ID)
+        ? 'verified'
+        : captchaStatus;
+
+    if (
+      !canSubmitWithVisibleRecaptcha({
+        captchaMode: effectiveCaptchaMode,
+        captchaStatus: resolvedCaptchaStatus,
+        isNativePlatform: isCapacitorNative
+      })
+    ) {
+      setCaptchaHighlight(true);
+      setError('Please complete the Firebase captcha box above to verify your device before requesting OTP.');
+      return;
+    }
+
     const isSameNumber = sendAttemptRef.current.phone === clean10;
     const attemptForNumber = isSameNumber ? Math.max(sendAttemptRef.current.count, sendAttempt) : 0;
     const lastProviderForNumber = isSameNumber ? (otpProviderRef.current ?? otpProvider) : null;
-    const forceProvider = resolveNextOtpProvider({
+    const baseForceProvider = resolveNextOtpProvider({
       sendAttempt: attemptForNumber,
       lastProvider: lastProviderForNumber
+    });
+    const forceProvider = resolveEffectiveForceProviderForCaptcha({
+      baseForceProvider,
+      captchaMode: effectiveCaptchaMode,
+      isNativePlatform: isCapacitorNative
     });
     const nextAttempt = attemptForNumber + 1;
     sendAttemptRef.current = { phone: clean10, count: nextAttempt };
@@ -860,6 +963,7 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
     hasCompletedPhoneAuthRef.current = false;
     isVerifyingOtpRef.current = false;
     isSendingOtpRef.current = true;
+    setCaptchaHighlight(false);
     setIsLoading(true);
     setIsWaitingOtp(true);
     setOtpAttemptId((prev) => prev + 1);
@@ -877,11 +981,17 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
     }
 
     try {
+      const targetCaptchaContainerId =
+        effectiveCaptchaMode === 'visible'
+          ? DEFAULT_VISIBLE_RECAPTCHA_CONTAINER_ID
+          : DEFAULT_INVISIBLE_RECAPTCHA_CONTAINER_ID;
+
       const res = await sendFirebasePhoneOtp(
         clean10,
-        'recaptcha-container',
+        targetCaptchaContainerId,
         {
           purpose: 'login',
+          recaptchaMode: effectiveCaptchaMode,
           onAutoFillOtp: (autoCode) => {
             codeDispatchedOrSettled = true;
             clearSlowSendTimer();
@@ -923,7 +1033,27 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
           setOtpProvider(attemptedProvider);
           otpProviderRef.current = attemptedProvider;
         }
-        setError(res.error || 'Failed to send OTP to mobile number. Please try again.');
+        if (
+          shouldEscalateToVisibleRecaptcha({
+            errorCode: res.diagnostic?.code,
+            errorMessage: res.error,
+            currentMode: effectiveCaptchaMode,
+            isNativePlatform: isCapacitorNative
+          })
+        ) {
+          setOtpSent(false);
+          setShowSecondField(false);
+          setCaptchaMode('visible');
+          setCaptchaHighlight(true);
+          setCaptchaMountNonce((prev) => prev + 1);
+          setInfoMessage('Device verification needs manual confirmation. Please tick the captcha box below and tap Get OTP.');
+        } else {
+          if (effectiveCaptchaMode === 'visible' && !isCapacitorNative) {
+            setCaptchaStatus('idle');
+            setCaptchaMountNonce((prev) => prev + 1);
+          }
+          setError(res.error || 'Failed to send OTP to mobile number. Please try again.');
+        }
       } else if (res.autoVerified) {
         const phone = res.formattedPhone || formatToE164Phone(clean10);
         const resolvedProvider = res.provider || forceProvider || 'firebase';
@@ -946,6 +1076,7 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
         setOtpCooldown(OTP_RESEND_COOLDOWN_SECONDS);
         setInfoMessage(null);
         setOtpCode('');
+        setCaptchaStatus('idle');
       }
     } catch (err: unknown) {
       codeDispatchedOrSettled = true;
@@ -953,6 +1084,10 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
       setIsWaitingOtp(false);
       stopNativeSmsOtpAutofill();
       setInfoMessage(null);
+      if (effectiveCaptchaMode === 'visible' && !isCapacitorNative) {
+        setCaptchaStatus('idle');
+        setCaptchaMountNonce((prev) => prev + 1);
+      }
       const msg = err instanceof Error ? err.message : 'Failed to send OTP.';
       setError(msg);
     } finally {
@@ -1720,8 +1855,8 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
                         if (digits.length === 11 && digits.startsWith('0')) {
                           val = digits.slice(1);
                         }
-                        if (!isCapacitorNative && digits.length >= 6) {
-                          prewarmRecaptchaVerifier('recaptcha-container');
+                        if (!isCapacitorNative && captchaMode === 'invisible' && digits.length >= 6) {
+                          prewarmRecaptchaVerifier(DEFAULT_INVISIBLE_RECAPTCHA_CONTAINER_ID);
                         }
                       }
                       setIdentifier(val);
@@ -1757,6 +1892,52 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
                     className="w-full bg-transparent py-2 text-sm font-medium text-slate-900 placeholder:text-slate-400 focus:outline-none"
                     required
                   />
+                </div>
+              </div>
+
+              {/* Simple Inline Firebase reCAPTCHA Iframe (Present alongside hidden #recaptcha-container) */}
+              <div
+                id="login-captcha-box-wrapper"
+                data-captcha-mode={captchaMode}
+                data-captcha-status={captchaStatus}
+                className={
+                  !isCapacitorNative && isPhone && !otpSent && captchaMode === 'visible'
+                    ? 'flex flex-col items-center justify-center pt-0.5'
+                    : 'hidden'
+                }
+              >
+                <div
+                  id="login-visible-captcha-panel"
+                  aria-hidden={isCapacitorNative || !isPhone || otpSent || captchaMode !== 'visible'}
+                  className={`relative w-full flex flex-col items-center justify-center rounded-lg transition-shadow duration-200 ${
+                    captchaHighlight ? 'ring-2 ring-amber-400/80 py-1' : ''
+                  }`}
+                >
+                  {captchaStatus === 'loading' && (
+                    <div className="absolute inset-0 z-10 flex items-center justify-center">
+                      <Loader2 className="w-4 h-4 text-amber-500 animate-spin" />
+                    </div>
+                  )}
+
+                  <div
+                    id={DEFAULT_VISIBLE_RECAPTCHA_CONTAINER_ID}
+                    className="w-full min-h-[78px] flex items-center justify-center max-[370px]:scale-[0.88] origin-center"
+                  />
+
+                  {(captchaStatus === 'expired' || captchaStatus === 'error') && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setCaptchaError(null);
+                        setCaptchaHighlight(false);
+                        setCaptchaMountNonce((n) => n + 1);
+                      }}
+                      className="mt-1.5 inline-flex items-center gap-1 text-[11px] font-semibold text-amber-700 hover:text-amber-800 cursor-pointer"
+                    >
+                      <RefreshCw className="w-3 h-3" />
+                      <span>{captchaError ? 'Retry' : 'Reload'}</span>
+                    </button>
+                  )}
                 </div>
               </div>
 

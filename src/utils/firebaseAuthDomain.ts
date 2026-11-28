@@ -476,4 +476,96 @@ export function shouldRetryFast2SmsVerifyAfterFirebaseFailure(params: {
   return true;
 }
 
+export type RecaptchaDisplayMode = 'invisible' | 'visible';
+export type RecaptchaWidgetStatus = 'idle' | 'loading' | 'ready' | 'verified' | 'expired' | 'error';
+
+export const DEFAULT_INVISIBLE_RECAPTCHA_CONTAINER_ID = 'recaptcha-container';
+export const DEFAULT_VISIBLE_RECAPTCHA_CONTAINER_ID = 'login-visible-recaptcha-container';
+
+/**
+ * Resolves the active DOM host container ID for Firebase RecaptchaVerifier so
+ * invisible (hidden) and visible (inline box) verifiers stay isolated in separate
+ * containers present in the DOM at the same time.
+ */
+export function resolveRecaptchaContainerId(
+  mode: RecaptchaDisplayMode,
+  customContainerId?: string
+): string {
+  const trimmed = String(customContainerId || '').trim();
+  if (mode === 'visible') {
+    if (!trimmed || trimmed === DEFAULT_INVISIBLE_RECAPTCHA_CONTAINER_ID) {
+      return DEFAULT_VISIBLE_RECAPTCHA_CONTAINER_ID;
+    }
+    return trimmed;
+  }
+  return trimmed || DEFAULT_INVISIBLE_RECAPTCHA_CONTAINER_ID;
+}
+
+/**
+ * Determines whether a web OTP dispatch failure in hidden/invisible mode should
+ * automatically reveal the inline visible reCAPTCHA box so the user can manually
+ * complete device verification.
+ */
+export function shouldEscalateToVisibleRecaptcha(params: {
+  errorCode?: string;
+  errorMessage?: string;
+  currentMode: RecaptchaDisplayMode;
+  isNativePlatform: boolean;
+}): boolean {
+  if (params.isNativePlatform) return false;
+  if (params.currentMode === 'visible') return false;
+
+  const code = String(params.errorCode || '').toLowerCase();
+  const msg = String(params.errorMessage || '').toLowerCase();
+
+  if (
+    code === 'auth/unauthorized-domain' ||
+    code === 'auth/invalid-phone-number' ||
+    code === 'auth/missing-phone-number' ||
+    code === 'auth/quota-exceeded' ||
+    code === 'auth/operation-not-allowed'
+  ) {
+    return false;
+  }
+
+  return (
+    code === 'auth/captcha-check-failed' ||
+    code === 'auth/invalid-app-credential' ||
+    code === 'auth/internal-error' ||
+    msg.includes('recaptcha') ||
+    msg.includes('captcha') ||
+    msg.includes('timed out waiting for google recaptcha')
+  );
+}
+
+/**
+ * Checks whether the login form may proceed to dispatch OTP given the current
+ * captcha visibility mode and verification status.
+ */
+export function canSubmitWithVisibleRecaptcha(params: {
+  captchaMode: RecaptchaDisplayMode;
+  captchaStatus: RecaptchaWidgetStatus;
+  isNativePlatform: boolean;
+}): boolean {
+  if (params.isNativePlatform) return true;
+  if (params.captchaMode === 'invisible') return true;
+  return params.captchaStatus === 'verified';
+}
+
+/**
+ * Resolves the effective OTP provider override for the current captcha mode:
+ * - Hidden/invisible mode keeps the default dual-gateway flow (Fast2SMS primary + Firebase fallback + Resend alternation).
+ * - Visible captcha mode explicitly routes through Firebase so the device captcha verification is enforced end-to-end.
+ */
+export function resolveEffectiveForceProviderForCaptcha(params: {
+  baseForceProvider?: OtpProvider;
+  captchaMode: RecaptchaDisplayMode;
+  isNativePlatform: boolean;
+}): OtpProvider | undefined {
+  if (params.captchaMode === 'visible') {
+    return 'firebase';
+  }
+  return params.baseForceProvider;
+}
+
 
