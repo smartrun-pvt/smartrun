@@ -12,6 +12,7 @@ import {
   Phone,
   User,
   ArrowLeft,
+  ChevronLeft,
   ShieldCheck,
   Fingerprint,
   Loader2
@@ -1606,7 +1607,7 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
         keywords="smartrun login, smartrun signup, electrical depot account, mobile otp login"
       />
 
-      {/* Fixed Top Back Navigation Button - Always clears Android status bar, notifications, signal & battery */}
+      {/* Fixed Top Back Navigation Button - Tailless Liquid Glass Chevron clearing status bar */}
       <div
         className={`fixed z-40 login-safe-top-anchor ${
           isNativeApp ? 'login-safe-top-native' : ''
@@ -1615,6 +1616,7 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
         <button
           type="button"
           id="login-back-store-btn"
+          aria-label={authStep !== 'primary' ? 'Back' : 'Back to Store'}
           onClick={() => {
             if (authStep !== 'primary') {
               setAuthStep('primary');
@@ -1625,23 +1627,22 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
               navigate('/', { replace: true });
             }
           }}
-          className="group px-3.5 py-1.5 bg-white/95 backdrop-blur-md border border-slate-200/90 shadow-[0_4px_14px_-3px_rgba(15,23,42,0.18)] text-slate-800 hover:text-slate-950 hover:bg-white hover:border-slate-300 hover:shadow-[0_6px_18px_-6px_rgba(15,23,42,0.22)] rounded-full transition-[transform,background-color,border-color,color,box-shadow] duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] cursor-pointer flex items-center gap-1.5 hover:-translate-x-0.5 active:scale-[0.94] active:translate-x-0 text-xs font-bold touch-manipulation will-change-transform"
+          className="group w-11 h-11 rounded-full login-liquid-glass-btn text-slate-900 hover:text-black transition-[transform,background,box-shadow] duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] cursor-pointer flex items-center justify-center hover:scale-[1.06] active:scale-[0.92] touch-manipulation will-change-transform focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-900/40"
           title={authStep !== 'primary' ? 'Back' : 'Back to Store'}
         >
-          <ArrowLeft className="w-4 h-4 stroke-[2.5] transition-transform duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] group-hover:-translate-x-0.5" />
-          <span>{authStep !== 'primary' ? 'Back' : 'Store'}</span>
+          <ChevronLeft className="relative z-10 w-6 h-6 stroke-[2.6] -translate-x-[1px] transition-transform duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] group-hover:-translate-x-[2.5px]" />
         </button>
       </div>
 
-      {/* Hero Section Background: Instant Native Animated SmartRun Hero (#ffcc00 box, #c1ff72 echo, black burst wordmark) */}
+      {/* Hero Section Background: Instant Native Animated SmartRun Hero (#ffcc00 box, #c1ff72 echo, black bounce wordmark) */}
       <LoginHeroBanner isKeyboardOpen={isKeyboardOpen} />
 
       {/* Main Login Container */}
       <div
-        className={`relative z-10 w-full max-w-none sm:max-w-md flex-1 sm:flex-none flex flex-col justify-center bg-white rounded-t-[28px] sm:rounded-[28px] -mt-5 mb-0 sm:mb-8 border-t sm:border border-slate-100/90 shadow-[0_-10px_30px_-14px_rgba(15,23,42,0.12)] sm:shadow-[0_14px_40px_-12px_rgba(15,23,42,0.14)] px-6 sm:px-7 transition-all duration-300 ${
+        className={`relative z-10 w-full max-w-none sm:max-w-md xl:max-w-[480px] 2xl:max-w-[500px] flex-none flex flex-col justify-start bg-white rounded-t-[28px] sm:rounded-[28px] -mt-5 sm:-mt-5 mb-0 sm:mb-6 xl:mb-8 border-t sm:border border-slate-100/90 shadow-[0_-10px_30px_-14px_rgba(15,23,42,0.12)] sm:shadow-[0_14px_40px_-12px_rgba(15,23,42,0.14)] px-6 sm:px-7 xl:px-8 transition-all duration-300 ${
           isKeyboardOpen
-            ? 'space-y-2 pt-4 pb-4'
-            : 'space-y-3.5 sm:space-y-4 pt-7 pb-[calc(var(--safe-area-bottom,env(safe-area-inset-bottom,0px))+2rem)] sm:py-8'
+            ? 'space-y-2 pt-4 pb-3.5'
+            : 'space-y-3 sm:space-y-3.5 xl:space-y-4 pt-5 pb-[calc(var(--safe-area-bottom,env(safe-area-inset-bottom,0px))+1.5rem)] sm:py-6 xl:py-7'
         }`}
       >
 
