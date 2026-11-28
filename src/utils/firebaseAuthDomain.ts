@@ -405,76 +405,14 @@ export function isRateLimitErrorCode(code: string): boolean {
   return c === 'auth/too-many-requests' || c === 'auth/quota-exceeded';
 }
 
-export type OtpProvider = 'fast2sms' | 'firebase';
-
-export const FAST_SMS_ABORT_TIMEOUT_MS = 12000;
 export const NATIVE_SLOW_SEND_NOTICE_MS = 15000;
-export const OTP_RESEND_COOLDOWN_SECONDS = 30;
-export const NATIVE_SLOW_SEND_INFO_MESSAGE = 'Taking longer than usual, please check your signal';
-
-/**
- * Resolves the `forceProvider` override for a phone OTP send attempt.
- * - First send for a phone number (`sendAttempt <= 0`): returns `undefined` (default gateway order).
- * - Resends (`sendAttempt > 0`) for the same number: alternates to the OTHER provider than `lastProvider`
- *   so silent non-delivery on one gateway is covered by the other.
- */
-export function resolveNextOtpProvider(params: {
-  sendAttempt: number;
-  lastProvider: OtpProvider | null | undefined;
-}): OtpProvider | undefined {
-  if (!Number.isFinite(params.sendAttempt) || params.sendAttempt <= 0) {
-    return undefined;
-  }
-  if (params.lastProvider === 'fast2sms') {
-    return 'firebase';
-  }
-  if (params.lastProvider === 'firebase') {
-    return 'fast2sms';
-  }
-  return undefined;
-}
-
-/**
- * Determines whether a non-OK response from `/api/auth/send-phone-otp` should stop immediately
- * with a user-facing validation error or fall through to Firebase Phone Auth.
- * HTTP 429 MUST always fall through to Firebase rather than blocking the user.
- */
-export function shouldStopOnFastSmsResponse(params: {
-  status: number;
-  error?: string;
-  fallbackToFirebase?: boolean;
-}): boolean {
-  if (params.status === 429) {
-    return false;
-  }
-  if (params.status === 400 && Boolean(params.error) && !params.fallbackToFirebase) {
-    return true;
-  }
-  return false;
-}
-
-/**
- * Determines whether a Firebase OTP confirmation failure should trigger a single fallback retry
- * against `POST /api/auth/verify-phone-otp` (`{ phone, otp }`, no token) because an earlier
- * Fast2SMS request timed out/aborted with an unknown outcome (`fastSmsMayHaveSent === true`).
- */
-export function shouldRetryFast2SmsVerifyAfterFirebaseFailure(params: {
-  firebaseErrorCode: string;
-  fastSmsMayHaveSent: boolean;
-  fastSmsMayHaveSentPhone?: string | null;
-  targetPhone?: string | null;
-}): boolean {
-  if (!params.fastSmsMayHaveSent) return false;
-  if (String(params.firebaseErrorCode || '').toLowerCase() !== 'auth/invalid-verification-code') {
-    return false;
-  }
-  const flagDigits = String(params.fastSmsMayHaveSentPhone || '').replace(/\D/g, '').slice(-10);
-  const targetDigits = String(params.targetPhone || '').replace(/\D/g, '').slice(-10);
-  if (flagDigits && targetDigits && flagDigits !== targetDigits) {
-    return false;
-  }
-  return true;
-}
+export const OTP_RESEND_COOLDOWN_SECONDS = 60;
+export const NATIVE_SLOW_SEND_INFO_MESSAGE =
+  'Still sending... a verification page may open, please complete it.';
+export const RATE_LIMIT_ERROR_MESSAGE =
+  'Too many attempts. Please wait 15-30 minutes and try again, or sign in with Google.';
+export const OTP_TIMEOUT_HINT =
+  'If you did not get the SMS, check network/DND and try again after a minute.';
 
 export type RecaptchaDisplayMode = 'invisible' | 'visible';
 export type RecaptchaWidgetStatus = 'idle' | 'loading' | 'ready' | 'verified' | 'expired' | 'error';
@@ -522,6 +460,7 @@ export function shouldEscalateToVisibleRecaptcha(params: {
     code === 'auth/unauthorized-domain' ||
     code === 'auth/invalid-phone-number' ||
     code === 'auth/missing-phone-number' ||
+    code === 'auth/too-many-requests' ||
     code === 'auth/quota-exceeded' ||
     code === 'auth/operation-not-allowed'
   ) {
@@ -551,21 +490,3 @@ export function canSubmitWithVisibleRecaptcha(params: {
   if (params.captchaMode === 'invisible') return true;
   return params.captchaStatus === 'verified';
 }
-
-/**
- * Resolves the effective OTP provider override for the current captcha mode:
- * - Hidden/invisible mode keeps the default dual-gateway flow (Fast2SMS primary + Firebase fallback + Resend alternation).
- * - Visible captcha mode explicitly routes through Firebase so the device captcha verification is enforced end-to-end.
- */
-export function resolveEffectiveForceProviderForCaptcha(params: {
-  baseForceProvider?: OtpProvider;
-  captchaMode: RecaptchaDisplayMode;
-  isNativePlatform: boolean;
-}): OtpProvider | undefined {
-  if (params.captchaMode === 'visible') {
-    return 'firebase';
-  }
-  return params.baseForceProvider;
-}
-
-

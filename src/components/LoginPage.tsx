@@ -63,15 +63,14 @@ import {
   parseIndianMobileNumber,
   shouldResetOtpSessionOnIdentifierChange,
   shouldRestorePendingOtpSession,
-  resolveNextOtpProvider,
   NATIVE_SLOW_SEND_NOTICE_MS,
   NATIVE_SLOW_SEND_INFO_MESSAGE,
   OTP_RESEND_COOLDOWN_SECONDS,
+  RATE_LIMIT_ERROR_MESSAGE,
   DEFAULT_INVISIBLE_RECAPTCHA_CONTAINER_ID,
   DEFAULT_VISIBLE_RECAPTCHA_CONTAINER_ID,
   shouldEscalateToVisibleRecaptcha,
   canSubmitWithVisibleRecaptcha,
-  resolveEffectiveForceProviderForCaptcha,
   type RecaptchaDisplayMode,
   type RecaptchaWidgetStatus
 } from '../utils/firebaseAuthDomain';
@@ -166,12 +165,10 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
   const [otpCode, setOtpCode] = useState('');
   const [otpCooldown, setOtpCooldown] = useState(0);
   const [sentToPhone, setSentToPhone] = useState('');
-  const [otpProvider, setOtpProvider] = useState<'firebase' | 'fast2sms' | null>(null);
-  const [sendAttempt, setSendAttempt] = useState(0);
   const [showSecondField, setShowSecondField] = useState(false);
 
-  // Hybrid Firebase Device Verification Captcha (both hidden #recaptcha-container & visible iframe host present together)
-  const [captchaMode, setCaptchaMode] = useState<RecaptchaDisplayMode>('visible');
+  // Hybrid Firebase Device Verification Captcha (invisible reCAPTCHA first on web; escalates to visible iframe only after an invisible failure)
+  const [captchaMode, setCaptchaMode] = useState<RecaptchaDisplayMode>('invisible');
   const [captchaStatus, setCaptchaStatus] = useState<RecaptchaWidgetStatus>('idle');
   const [captchaError, setCaptchaError] = useState<string | null>(null);
   const [captchaHighlight, setCaptchaHighlight] = useState(false);
@@ -213,8 +210,6 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
   const isVerifyingOtpRef = useRef(false);
   const hasCompletedPhoneAuthRef = useRef(false);
   const isManualPasskeyActiveRef = useRef(false);
-  const sendAttemptRef = useRef<{ phone: string; count: number }>({ phone: '', count: 0 });
-  const otpProviderRef = useRef<'firebase' | 'fast2sms' | null>(null);
   const slowSendTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const latestVerifyPhoneOtpRef = useRef<(overrideOtp?: string) => Promise<void>>(async () => {});
 
@@ -223,13 +218,6 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
       clearTimeout(slowSendTimerRef.current);
       slowSendTimerRef.current = null;
     }
-  };
-
-  const resetPhoneAttemptTracking = () => {
-    sendAttemptRef.current = { phone: '', count: 0 };
-    otpProviderRef.current = null;
-    setSendAttempt(0);
-    setOtpProvider(null);
   };
 
   useEffect(() => {
@@ -432,7 +420,7 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
         resetRecaptchaVerifier();
         setOtpSent(false);
         setIsWaitingOtp(false);
-        setOtpProvider(null);
+        setCaptchaMode('invisible');
         setShowSecondField(false);
         setOtpCode('');
         setPassword('');
@@ -509,14 +497,6 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
 
       setIdentifier((prev) => (prev.trim() ? prev : parsedPending.clean10));
       setSentToPhone(parsedPending.e164);
-      setOtpProvider(pending.provider);
-      otpProviderRef.current = pending.provider;
-      const restoredCount =
-        sendAttemptRef.current.phone === parsedPending.clean10
-          ? Math.max(1, sendAttemptRef.current.count)
-          : 1;
-      sendAttemptRef.current = { phone: parsedPending.clean10, count: restoredCount };
-      setSendAttempt(restoredCount);
       setOtpSent(true);
       setShowSecondField(true);
       setIsWaitingOtp(false);
@@ -545,7 +525,7 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
   useEffect(() => {
     if (!isListeningForNativeSmsConsent) return;
 
-    const armDelayMs = otpProvider === 'firebase' ? 1200 : 150;
+    const armDelayMs = 1200;
     const armTimer = setTimeout(() => {
       if (!hasCompletedPhoneAuthRef.current && !isVerifyingOtpRef.current) {
         startNativeSmsOtpAutofill();
@@ -566,7 +546,7 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
       unsubscribe();
       stopNativeSmsOtpAutofill();
     };
-  }, [isListeningForNativeSmsConsent, otpAttemptId, otpProvider]);
+  }, [isListeningForNativeSmsConsent, otpAttemptId]);
 
   // WebAuthn Passkey Conditional Autofill (web browsers only; skipped in Capacitor WebView where native Credential Manager handles passkeys)
   useEffect(() => {
@@ -912,7 +892,7 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
     }
   };
 
-  // --- 2. SEND PHONE OTP ---
+  // --- 2. SEND PHONE OTP (FIREBASE PHONE AUTH ONLY) ---
   const handleSendPhoneOtp = async () => {
     if (isSendingOtpRef.current) return;
     resetMessages();
@@ -926,7 +906,7 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
     const isResendAttempt = otpSent && showSecondField;
     const effectiveCaptchaMode: RecaptchaDisplayMode = isResendAttempt ? 'invisible' : captchaMode;
 
-    // In Visible Captcha mode on web, require the user to solve the inline "I'm not a robot" box first
+    // In Visible Captcha mode on web (escalated after invisible failure), require solving the captcha first
     const resolvedCaptchaStatus: RecaptchaWidgetStatus =
       effectiveCaptchaMode === 'visible' && !isCapacitorNative && isVisibleRecaptchaVerified(DEFAULT_VISIBLE_RECAPTCHA_CONTAINER_ID)
         ? 'verified'
@@ -944,21 +924,10 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
       return;
     }
 
-    const isSameNumber = sendAttemptRef.current.phone === clean10;
-    const attemptForNumber = isSameNumber ? Math.max(sendAttemptRef.current.count, sendAttempt) : 0;
-    const lastProviderForNumber = isSameNumber ? (otpProviderRef.current ?? otpProvider) : null;
-    const baseForceProvider = resolveNextOtpProvider({
-      sendAttempt: attemptForNumber,
-      lastProvider: lastProviderForNumber
-    });
-    const forceProvider = resolveEffectiveForceProviderForCaptcha({
-      baseForceProvider,
-      captchaMode: effectiveCaptchaMode,
-      isNativePlatform: isCapacitorNative
-    });
-    const nextAttempt = attemptForNumber + 1;
-    sendAttemptRef.current = { phone: clean10, count: nextAttempt };
-    setSendAttempt(nextAttempt);
+    // On web resend, always allocate a fresh reCAPTCHA slot cleanly
+    if (isResendAttempt && !isCapacitorNative) {
+      resetRecaptchaVerifier(DEFAULT_INVISIBLE_RECAPTCHA_CONTAINER_ID);
+    }
 
     hasCompletedPhoneAuthRef.current = false;
     isVerifyingOtpRef.current = false;
@@ -986,40 +955,35 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
           ? DEFAULT_VISIBLE_RECAPTCHA_CONTAINER_ID
           : DEFAULT_INVISIBLE_RECAPTCHA_CONTAINER_ID;
 
-      const res = await sendFirebasePhoneOtp(
-        clean10,
-        targetCaptchaContainerId,
-        {
-          purpose: 'login',
-          recaptchaMode: effectiveCaptchaMode,
-          onAutoFillOtp: (autoCode) => {
-            codeDispatchedOrSettled = true;
-            clearSlowSendTimer();
-            if (hasCompletedPhoneAuthRef.current) return;
-            setInfoMessage(null);
-            setShowSecondField(true);
-            setOtpSent(true);
-            setOtpCode(autoCode);
-          },
-          onNativeVerificationCompleted: async (nativeResult) => {
-            codeDispatchedOrSettled = true;
-            clearSlowSendTimer();
-            if (hasCompletedPhoneAuthRef.current || isVerifyingOtpRef.current) return;
-            isVerifyingOtpRef.current = true;
-            setIsLoading(true);
-            try {
-              await completeVerifiedPhoneLogin(nativeResult, clean10);
-            } catch (nativeErr: unknown) {
-              const msg = nativeErr instanceof Error ? nativeErr.message : 'Automatic OTP verification failed. Please try again.';
-              setError(msg);
-            } finally {
-              isVerifyingOtpRef.current = false;
-              setIsLoading(false);
-            }
-          }
+      const res = await sendFirebasePhoneOtp(clean10, targetCaptchaContainerId, {
+        purpose: 'login',
+        recaptchaMode: effectiveCaptchaMode,
+        onAutoFillOtp: (autoCode) => {
+          codeDispatchedOrSettled = true;
+          clearSlowSendTimer();
+          if (hasCompletedPhoneAuthRef.current) return;
+          setInfoMessage(null);
+          setShowSecondField(true);
+          setOtpSent(true);
+          setOtpCode(autoCode);
         },
-        forceProvider
-      );
+        onNativeVerificationCompleted: async (nativeResult) => {
+          codeDispatchedOrSettled = true;
+          clearSlowSendTimer();
+          if (hasCompletedPhoneAuthRef.current || isVerifyingOtpRef.current) return;
+          isVerifyingOtpRef.current = true;
+          setIsLoading(true);
+          try {
+            await completeVerifiedPhoneLogin(nativeResult, clean10);
+          } catch (nativeErr: unknown) {
+            const msg = nativeErr instanceof Error ? nativeErr.message : 'Automatic OTP verification failed. Please try again.';
+            setError(msg);
+          } finally {
+            isVerifyingOtpRef.current = false;
+            setIsLoading(false);
+          }
+        }
+      });
 
       codeDispatchedOrSettled = true;
       clearSlowSendTimer();
@@ -1028,12 +992,10 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
         setIsWaitingOtp(false);
         stopNativeSmsOtpAutofill();
         setInfoMessage(null);
-        const attemptedProvider = res.provider || forceProvider || null;
-        if (attemptedProvider) {
-          setOtpProvider(attemptedProvider);
-          otpProviderRef.current = attemptedProvider;
-        }
-        if (
+        if (res.isRateLimited) {
+          setOtpCooldown(OTP_RESEND_COOLDOWN_SECONDS);
+          setError(res.error || RATE_LIMIT_ERROR_MESSAGE);
+        } else if (
           shouldEscalateToVisibleRecaptcha({
             errorCode: res.diagnostic?.code,
             errorMessage: res.error,
@@ -1056,10 +1018,7 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
         }
       } else if (res.autoVerified) {
         const phone = res.formattedPhone || formatToE164Phone(clean10);
-        const resolvedProvider = res.provider || forceProvider || 'firebase';
         setSentToPhone(phone);
-        setOtpProvider(resolvedProvider);
-        otpProviderRef.current = resolvedProvider;
         setOtpCooldown(OTP_RESEND_COOLDOWN_SECONDS);
         setInfoMessage(null);
         if (isVerifyingOtpRef.current && !hasCompletedPhoneAuthRef.current) {
@@ -1067,10 +1026,7 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
         }
       } else {
         const phone = res.formattedPhone || formatToE164Phone(clean10);
-        const resolvedProvider = res.provider || forceProvider || 'firebase';
         setSentToPhone(phone);
-        setOtpProvider(resolvedProvider);
-        otpProviderRef.current = resolvedProvider;
         setOtpSent(true);
         setShowSecondField(true);
         setOtpCooldown(OTP_RESEND_COOLDOWN_SECONDS);
@@ -1724,7 +1680,7 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
           setShowSecondField(false);
           setOtpCode('');
           setSentToPhone('');
-          resetPhoneAttemptTracking();
+          setCaptchaMode('invisible');
           setOtpCooldown(0);
           setIsWaitingOtp(false);
           setAuthStep('primary');
@@ -1876,14 +1832,9 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
                         setShowSecondField(false);
                         setOtpCode('');
                         setSentToPhone('');
-                        resetPhoneAttemptTracking();
+                        setCaptchaMode('invisible');
                         setOtpCooldown(0);
                         setIsWaitingOtp(false);
-                      } else if (sendAttemptRef.current.count > 0) {
-                        const parsedNext = parseIndianMobileNumber(val);
-                        if (!parsedNext.valid || parsedNext.clean10 !== sendAttemptRef.current.phone) {
-                          resetPhoneAttemptTracking();
-                        }
                       }
                       if (!isPhoneInput(val) && val.includes('@')) {
                         setShowSecondField(true);
@@ -2017,7 +1968,7 @@ export const LoginPage = ({ onAuthSuccess }: LoginPageProps) => {
                           resetRecaptchaVerifier();
                           setOtpSent(false);
                           setIsWaitingOtp(false);
-                          resetPhoneAttemptTracking();
+                          setCaptchaMode('invisible');
                           setShowSecondField(false);
                           setOtpCode('');
                           resetMessages();

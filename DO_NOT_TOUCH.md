@@ -14,7 +14,7 @@ The following components, pages, and architectural modules are verified producti
    - `src/components/OrderHistoryView.tsx`: Short 8-character uppercase hex order IDs (`#DE7A0E6C`).
 
 3. **Authentication & Identity**:
-   - `src/components/LoginPage.tsx`: Fast2SMS OTP, Google OAuth (web origin vs smartrun:// deep link), WebAuthn passkey.
+   - `src/components/LoginPage.tsx`: Firebase Phone Auth OTP (native APK + web invisible-first reCAPTCHA), Google OAuth (web origin vs smartrun:// deep link), WebAuthn passkey.
    - `src/services/firebaseAuthService.ts`: Seamless phone-email linking, master user ID persistence.
    - `src/services/welcomeEmailService.ts`: One-time onboarding email dispatch with multi-layer deduplication.
 

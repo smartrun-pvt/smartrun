@@ -15,19 +15,16 @@ import {
   normalizeNativeFirebaseAuthError,
   buildRecaptchaSlotId,
   isRecaptchaAlreadyRenderedError,
-  FAST_SMS_ABORT_TIMEOUT_MS,
   NATIVE_SLOW_SEND_NOTICE_MS,
   NATIVE_SLOW_SEND_INFO_MESSAGE,
   OTP_RESEND_COOLDOWN_SECONDS,
-  resolveNextOtpProvider,
-  shouldStopOnFastSmsResponse,
-  shouldRetryFast2SmsVerifyAfterFirebaseFailure,
+  RATE_LIMIT_ERROR_MESSAGE,
+  OTP_TIMEOUT_HINT,
   DEFAULT_INVISIBLE_RECAPTCHA_CONTAINER_ID,
   DEFAULT_VISIBLE_RECAPTCHA_CONTAINER_ID,
   resolveRecaptchaContainerId,
   shouldEscalateToVisibleRecaptcha,
   canSubmitWithVisibleRecaptcha,
-  resolveEffectiveForceProviderForCaptcha,
 } from './firebaseAuthDomain';
 import { extractOtpDigits } from './otpAutofill';
 import { resolveWebAuthnRpConfig } from './passkeyHelper';
@@ -268,83 +265,24 @@ test('AndroidManifest HTTPS App Links scope to app routes so /__/auth/* is never
   assert.doesNotMatch(filterBody, /\/__\/firebase/);
 });
 
-test('OTP reliability policy: provider alternation, 429 fallthrough, timers, and ambiguous abort retry', () => {
-  // Constants match Android APK reliability thresholds
-  assert.equal(FAST_SMS_ABORT_TIMEOUT_MS, 12000);
+test('Firebase-only OTP reliability policy: 60s resend cooldown, slow-send notice, rate-limit & timeout copy', () => {
   assert.equal(NATIVE_SLOW_SEND_NOTICE_MS, 15000);
-  assert.equal(OTP_RESEND_COOLDOWN_SECONDS, 30);
-  assert.equal(NATIVE_SLOW_SEND_INFO_MESSAGE, 'Taking longer than usual, please check your signal');
-
-  // First send always uses default gateway order
-  assert.equal(resolveNextOtpProvider({ sendAttempt: 0, lastProvider: null }), undefined);
-  assert.equal(resolveNextOtpProvider({ sendAttempt: 0, lastProvider: 'fast2sms' }), undefined);
-  assert.equal(resolveNextOtpProvider({ sendAttempt: 0, lastProvider: 'firebase' }), undefined);
-
-  // Resends for the same number alternate to the OTHER provider
-  assert.equal(resolveNextOtpProvider({ sendAttempt: 1, lastProvider: 'fast2sms' }), 'firebase');
-  assert.equal(resolveNextOtpProvider({ sendAttempt: 2, lastProvider: 'firebase' }), 'fast2sms');
-  assert.equal(resolveNextOtpProvider({ sendAttempt: 1, lastProvider: null }), undefined);
-
-  // HTTP 429 from /api/auth/send-phone-otp must fall through to native Firebase (never stop)
+  assert.equal(OTP_RESEND_COOLDOWN_SECONDS, 60);
   assert.equal(
-    shouldStopOnFastSmsResponse({ status: 429, error: 'Too many requests', fallbackToFirebase: false }),
-    false
+    NATIVE_SLOW_SEND_INFO_MESSAGE,
+    'Still sending... a verification page may open, please complete it.'
   );
   assert.equal(
-    shouldStopOnFastSmsResponse({ status: 429, error: 'Please wait 5 seconds' }),
-    false
+    RATE_LIMIT_ERROR_MESSAGE,
+    'Too many attempts. Please wait 15-30 minutes and try again, or sign in with Google.'
   );
   assert.equal(
-    shouldStopOnFastSmsResponse({ status: 502, error: 'Gateway timeout', fallbackToFirebase: true }),
-    false
-  );
-  // HTTP 400 validation error without fallbackToFirebase stops immediately
-  assert.equal(
-    shouldStopOnFastSmsResponse({ status: 400, error: 'Invalid phone number.' }),
-    true
-  );
-
-  // Ambiguous Fast2SMS abort retry triggers only on auth/invalid-verification-code for same phone
-  assert.equal(
-    shouldRetryFast2SmsVerifyAfterFirebaseFailure({
-      firebaseErrorCode: 'auth/invalid-verification-code',
-      fastSmsMayHaveSent: true,
-      fastSmsMayHaveSentPhone: '9876543210',
-      targetPhone: '+919876543210',
-    }),
-    true
-  );
-  assert.equal(
-    shouldRetryFast2SmsVerifyAfterFirebaseFailure({
-      firebaseErrorCode: 'auth/invalid-verification-code',
-      fastSmsMayHaveSent: false,
-      fastSmsMayHaveSentPhone: '9876543210',
-      targetPhone: '+919876543210',
-    }),
-    false
-  );
-  assert.equal(
-    shouldRetryFast2SmsVerifyAfterFirebaseFailure({
-      firebaseErrorCode: 'auth/code-expired',
-      fastSmsMayHaveSent: true,
-      fastSmsMayHaveSentPhone: '9876543210',
-      targetPhone: '+919876543210',
-    }),
-    false
-  );
-  // Cross-phone isolation: never retry Fast2SMS verify for a different phone number
-  assert.equal(
-    shouldRetryFast2SmsVerifyAfterFirebaseFailure({
-      firebaseErrorCode: 'auth/invalid-verification-code',
-      fastSmsMayHaveSent: true,
-      fastSmsMayHaveSentPhone: '9876543210',
-      targetPhone: '+919876543219',
-    }),
-    false
+    OTP_TIMEOUT_HINT,
+    'If you did not get the SMS, check network/DND and try again after a minute.'
   );
 });
 
-test('Dual-mode Firebase reCAPTCHA policy: isolated containers, visible gating, escalation, and provider selection', () => {
+test('Firebase web reCAPTCHA policy: isolated containers, visible gating, and invisible-first escalation', () => {
   // Hidden and visible containers stay strictly isolated
   assert.equal(
     resolveRecaptchaContainerId('invisible'),
@@ -385,7 +323,7 @@ test('Dual-mode Firebase reCAPTCHA policy: isolated containers, visible gating, 
     true
   );
 
-  // Escalates from hidden -> visible on web captcha failures, never on native or domain/quota errors
+  // Escalates from hidden -> visible on web captcha failures, never on native, domain, or rate-limit/quota errors
   assert.equal(
     shouldEscalateToVisibleRecaptcha({
       errorCode: 'auth/captcha-check-failed',
@@ -427,32 +365,20 @@ test('Dual-mode Firebase reCAPTCHA policy: isolated containers, visible gating, 
     }),
     false
   );
-
-  // Visible captcha mode enforces Firebase verification; hidden mode preserves default/alternating provider
   assert.equal(
-    resolveEffectiveForceProviderForCaptcha({
-      baseForceProvider: undefined,
-      captchaMode: 'invisible',
+    shouldEscalateToVisibleRecaptcha({
+      errorCode: 'auth/too-many-requests',
+      currentMode: 'invisible',
       isNativePlatform: false,
     }),
-    undefined
+    false
   );
   assert.equal(
-    resolveEffectiveForceProviderForCaptcha({
-      baseForceProvider: 'fast2sms',
-      captchaMode: 'invisible',
+    shouldEscalateToVisibleRecaptcha({
+      errorCode: 'auth/quota-exceeded',
+      currentMode: 'invisible',
       isNativePlatform: false,
     }),
-    'fast2sms'
-  );
-  assert.equal(
-    resolveEffectiveForceProviderForCaptcha({
-      baseForceProvider: undefined,
-      captchaMode: 'visible',
-      isNativePlatform: false,
-    }),
-    'firebase'
+    false
   );
 });
-
-

@@ -4,12 +4,12 @@
 - **Frontend**: React 19 SPA, Vite 6, Tailwind CSS 4, React Router 7, TypeScript 5.8
 - **Mobile Runtime**: Capacitor 8 Native Android App (`in.smartrun.app`), Gradle 8, Android SDK 35 (Android 15 Production Target, CompileSdk 36)
 - **Backend**: Express 4 Node.js server (`server.ts`), tsx dev server, Cloud Run production container (`0.0.0.0:8080`)
-- **Database & Auth**: Supabase PostgreSQL + Firebase Firestore + Fast2SMS OTP Gateway + Resend Email Gateway
+- **Database & Auth**: Supabase PostgreSQL + Firebase Firestore + Firebase Phone Auth (Native APK + Web reCAPTCHA) + Resend Email Gateway
 
 ## Directory Tree Overview
 - `/src`: App entry (`App.tsx`), UI components (`/components`), services (`/services`), utils (`/utils`), types (`types.ts`)
 - `/android`: Capacitor Android native project (`/android/app/google-services.json`, `/android/app/build.gradle`, `/android/app/proguard-rules.pro`, `/android/app/missing_rules.txt`, `/android/app/src/main/assets/public`)
-- `server.ts`: Cloud Run backend API, Resend email dispatcher, Razorpay payments, SMS OTP, delivery & order tracking
+- `server.ts`: Cloud Run backend API, Resend email dispatcher, Razorpay payments, Firebase Phone Auth session bridge, delivery & order tracking
 - `Dockerfile`: Multi-stage Cloud Run production container build
 
 ## Completed UI & Backend Phases

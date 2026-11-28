@@ -116,3 +116,10 @@
   2. Products missing valid IDs or having `price <= 0` are dropped cleanly; item IDs are deduplicated (`seenItemIds`).
   3. `server.ts` passes `?color=` and live `getServerFeePolicy()` rates into SSR `normalizeProductForSeo` and `generateGoogleMerchantFeed`, while `ProductDetailPage.tsx` reads `useSearchParams().get('color')` on mount so CSR JSON-LD, OpenGraph `product:*` tags, and visual UI match the Merchant feed 1:1.
 
+## Threat 18: SMS Pumping, Dual-Gateway Token Confusion & Rate-Limit Retry Storms
+- **Attack Vector**: 1) An adversary spams a secondary SMS gateway (`/api/auth/send-phone-otp`) or replays/forges custom HMAC OTP tokens (`/api/auth/verify-phone-otp`) to drain SMS wallet balance or bypass Firebase Phone Auth; 2) Rapid Resend clicks or automatic retries after `auth/too-many-requests` / `auth/quota-exceeded` trigger Firebase account-level SMS lockouts.
+- **Defense**:
+  1. Completely removed Fast2SMS endpoints (`POST /api/auth/send-phone-otp`, `POST /api/auth/verify-phone-otp`), in-memory OTP stores, and `FAST2SMS_API_KEY` usage from `server.ts` and client services. `POST /api/auth/phone-login-session` strictly requires a valid Firebase Phone Auth ID token verified via `verifyFirebasePhoneIdToken`.
+  2. Raised `OTP_RESEND_COOLDOWN_SECONDS` to `60` seconds with a live countdown on the Resend button; Resend always stays on the same Firebase path (fresh reCAPTCHA slot on web, direct native `signInWithPhoneNumber` on APK) with zero provider alternation.
+  3. On `auth/too-many-requests` or `auth/quota-exceeded`, both client service and `LoginPage` immediately short-circuit (zero auto-retry, zero visible reCAPTCHA escalation), display `"Too many attempts. Please wait 15-30 minutes and try again, or sign in with Google."`, and enforce a 60s Resend cooldown.
+

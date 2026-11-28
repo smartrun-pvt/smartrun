@@ -33,13 +33,11 @@ import {
   parseIndianMobileNumber,
   isExpiredOtpErrorCode,
   isRateLimitErrorCode,
-  FAST_SMS_ABORT_TIMEOUT_MS,
-  shouldStopOnFastSmsResponse,
-  shouldRetryFast2SmsVerifyAfterFirebaseFailure,
+  RATE_LIMIT_ERROR_MESSAGE,
+  OTP_TIMEOUT_HINT,
   DEFAULT_INVISIBLE_RECAPTCHA_CONTAINER_ID,
   DEFAULT_VISIBLE_RECAPTCHA_CONTAINER_ID,
   resolveRecaptchaContainerId,
-  type OtpProvider,
   type RecaptchaDisplayMode,
   type RecaptchaWidgetStatus
 } from '../utils/firebaseAuthDomain';
@@ -95,10 +93,6 @@ let recaptchaSlotSeq = 0;
 let recaptchaRenderSeq = 0;
 let activeSendRequestSeq = 0;
 let lastSentPhoneNumber: string | null = null;
-let activeBackendOtpToken: string | null = null;
-let activeBackendOtpPhone: string | null = null;
-let fastSmsMayHaveSent = false;
-let fastSmsMayHaveSentPhone: string | null = null;
 let activeNativeVerificationId: string | null = null;
 let activeNativeCompletedSub: { remove?: () => Promise<void> | void } | null = null;
 let activeNativeCodeSentSub: { remove?: () => Promise<void> | void } | null = null;
@@ -129,11 +123,9 @@ const PENDING_PHONE_OTP_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
 export interface PendingPhoneOtpSession {
   phone: string; // E.164 (+91XXXXXXXXXX)
-  provider: 'firebase' | 'fast2sms';
+  provider: 'firebase';
   purpose?: 'login' | 'profile_update';
   verificationId?: string;
-  backendToken?: string;
-  fastSmsMayHaveSent?: boolean;
   createdAt: number;
 }
 
@@ -146,10 +138,6 @@ export function savePendingPhoneOtpSession(session: PendingPhoneOtpSession): voi
 
 export function clearPendingPhoneOtpSession(): void {
   activeNativeVerificationId = null;
-  activeBackendOtpToken = null;
-  activeBackendOtpPhone = null;
-  fastSmsMayHaveSent = false;
-  fastSmsMayHaveSentPhone = null;
   try {
     if (typeof window !== 'undefined') {
       localStorage.removeItem(PENDING_PHONE_OTP_STORAGE_KEY);
@@ -163,39 +151,20 @@ export function getPendingPhoneOtpSession(): PendingPhoneOtpSession | null {
   const nativePending = getNativePendingPhoneVerification();
   if (nativePending?.verificationId) {
     const formatted = nativePending.phone ? formatToE164Phone(nativePending.phone) : '';
-    let restoredFastSmsMayHaveSent = false;
-    try {
-      if (typeof window !== 'undefined') {
-        const raw = localStorage.getItem(PENDING_PHONE_OTP_STORAGE_KEY);
-        if (raw) {
-          const parsedLocal = JSON.parse(raw) as PendingPhoneOtpSession;
-          const localDigits = String(parsedLocal?.phone || '').replace(/\D/g, '').slice(-10);
-          const nativeDigits = formatted.replace(/\D/g, '').slice(-10);
-          if (parsedLocal?.fastSmsMayHaveSent && (!nativeDigits || localDigits === nativeDigits)) {
-            restoredFastSmsMayHaveSent = true;
-          }
-        }
-      }
-    } catch {}
     const session: PendingPhoneOtpSession = {
       phone: formatted,
       provider: 'firebase',
       verificationId: nativePending.verificationId,
-      ...(restoredFastSmsMayHaveSent ? { fastSmsMayHaveSent: true } : {}),
       createdAt: nativePending.timestamp
     };
     activeNativeVerificationId = nativePending.verificationId;
     if (formatted) {
       lastSentPhoneNumber = formatted;
     }
-    if (restoredFastSmsMayHaveSent) {
-      fastSmsMayHaveSent = true;
-      fastSmsMayHaveSentPhone = formatted.replace(/\D/g, '').slice(-10) || null;
-    }
     return session;
   }
 
-  // 2. Fallback to localStorage (survives page reload / WebView refresh for both Firebase and Fast2SMS)
+  // 2. Fallback to localStorage (survives page reload / WebView refresh for Firebase sessions)
   try {
     if (typeof window === 'undefined') return null;
     const raw = localStorage.getItem(PENDING_PHONE_OTP_STORAGE_KEY);
@@ -211,16 +180,6 @@ export function getPendingPhoneOtpSession(): PendingPhoneOtpSession | null {
     }
     if (parsed.provider === 'firebase' && parsed.verificationId) {
       activeNativeVerificationId = parsed.verificationId;
-      lastSentPhoneNumber = formatToE164Phone(parsed.phone);
-      if (parsed.fastSmsMayHaveSent) {
-        fastSmsMayHaveSent = true;
-        fastSmsMayHaveSentPhone = parsed.phone.replace(/\D/g, '').slice(-10) || null;
-      }
-      return parsed;
-    }
-    if (parsed.provider === 'fast2sms' && parsed.backendToken) {
-      activeBackendOtpToken = parsed.backendToken;
-      activeBackendOtpPhone = parsed.phone.replace(/\D/g, '').slice(-10);
       lastSentPhoneNumber = formatToE164Phone(parsed.phone);
       return parsed;
     }
@@ -352,7 +311,7 @@ export function formatFirebasePhoneError(err: any): FirebaseDiagnostic {
     case 'auth/quota-exceeded':
       return {
         code,
-        userMessage: 'Firebase Error (auth/quota-exceeded): Daily SMS quota exceeded in Firebase / Google Cloud.',
+        userMessage: RATE_LIMIT_ERROR_MESSAGE,
         technicalCause: 'Identity Platform SMS quota limit reached for the current billing cycle.',
         resolution: 'In Google Cloud Console -> Identity Platform -> Settings -> Quotas, check daily SMS quota. Or add Test Phone Numbers in Firebase Console.'
       };
@@ -360,12 +319,11 @@ export function formatFirebasePhoneError(err: any): FirebaseDiagnostic {
     case 'auth/too-many-requests':
       return {
         code,
-        userMessage:
-          'Firebase Error (auth/too-many-requests): Temporarily blocked by Firebase anti-abuse protection (repeated attempts or failed app verification). Please wait a while before retrying.',
+        userMessage: RATE_LIMIT_ERROR_MESSAGE,
         technicalCause:
           rawMsg || 'Firebase anti-abuse rate limit was triggered for this device or phone number (failed Play Integrity / reCAPTCHA attempts also count toward this block even if no SMS was sent).',
         resolution:
-          'Wait 1–4 hours before retrying this number/device, or add a test phone number in Firebase Console -> Authentication -> Sign-in method -> Phone -> Phone numbers for testing.'
+          'Wait 15-30 minutes before retrying this number/device, or sign in with Google.'
       };
 
     case 'auth/invalid-phone-number':
@@ -737,7 +695,7 @@ export function prewarmRecaptchaVerifier(
 export interface SendFirebaseOtpResult {
   success: boolean;
   formattedPhone?: string;
-  provider?: 'fast2sms' | 'firebase';
+  provider?: 'firebase';
   autoVerified?: boolean;
   error?: string;
   isBillingRequired?: boolean;
@@ -748,7 +706,6 @@ export interface SendFirebaseOtpResult {
 
 export interface SendFirebaseOtpCallbacks {
   purpose?: 'login' | 'profile_update';
-  forceProvider?: OtpProvider;
   recaptchaMode?: RecaptchaDisplayMode;
   onAutoFillOtp?: (code: string) => void;
   onNativeVerificationCompleted?: (result: VerifyFirebaseOtpResult) => void;
@@ -775,16 +732,15 @@ async function resolveFirebaseIdToken(firebaseUser?: FirebaseUser): Promise<stri
 }
 
 /**
- * Sends phone OTP via official Google Firebase Phone Auth SDK.
+ * Sends phone OTP via official Google Firebase Phone Auth SDK only.
  * On native Android / iOS devices, utilizes native Play Integrity, Instant Verification,
  * and Google Play Services SMS Auto-Retrieval without web reCAPTCHA or localhost origin restrictions.
- * On Web, utilizes Firebase Web SDK with headless reCAPTCHA and server fallback.
+ * On Web, utilizes Firebase Web SDK with invisible reCAPTCHA first (escalating to visible reCAPTCHA on failure).
  */
 export async function sendFirebasePhoneOtp(
   rawPhone: string,
   containerId = 'recaptcha-container',
-  callbacks?: SendFirebaseOtpCallbacks,
-  forceProvider?: OtpProvider
+  callbacks?: SendFirebaseOtpCallbacks
 ): Promise<SendFirebaseOtpResult> {
   const parsedPhone = parseIndianMobileNumber(rawPhone);
   if (!parsedPhone.valid) {
@@ -794,102 +750,14 @@ export async function sendFirebasePhoneOtp(
     };
   }
 
-  const digits = parsedPhone.clean10;
   const formattedPhone = parsedPhone.e164;
   const purpose = callbacks?.purpose || 'login';
-  const effectiveForceProvider = forceProvider ?? callbacks?.forceProvider;
   const requestSeq = ++activeSendRequestSeq;
 
   lastSentPhoneNumber = formattedPhone;
   activeConfirmationResult = null;
   clearPendingPhoneOtpSession();
   clearNativePhoneListeners();
-
-  // 0. FAST PAN-INDIA DLT SMS GATEWAY FIRST (Fast2SMS Dev API on server)
-  // Skipped when forceProvider === 'firebase' so resends can go straight to native/web Firebase.
-  // When FAST2SMS_API_KEY is configured on production server:
-  // - Delivers real TRAI DLT Indian OTP SMS in 2-5 seconds across ALL 22 circles (including outside Kolkata & DND)
-  // - Zero Chrome Custom Tab / reCAPTCHA page and zero *.firebaseapp.com SMS domain on Android APK & Web!
-  // If not configured, rate-limited (HTTP 429), rejected, or timed out, we seamlessly continue to Firebase.
-  if (effectiveForceProvider !== 'firebase') {
-    const controller = new AbortController();
-    let fastAborted = false;
-    const fastTimer = setTimeout(() => {
-      fastAborted = true;
-      controller.abort();
-    }, FAST_SMS_ABORT_TIMEOUT_MS);
-    try {
-      const fastResp = await fetch(apiUrl('/api/auth/send-phone-otp'), {
-        method: 'POST',
-        credentials: 'include',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ phone: digits, preferFastSms: true }),
-        signal: controller.signal
-      });
-      if (requestSeq !== activeSendRequestSeq) {
-        return { success: false, formattedPhone, error: 'OTP request superseded by a newer attempt.' };
-      }
-      const fastData = await fastResp.json().catch(() => null);
-      if (fastResp.ok && fastData?.success && fastData?.delivered && fastData?.token) {
-        activeBackendOtpToken = fastData.token;
-        activeBackendOtpPhone = digits;
-        savePendingPhoneOtpSession({
-          phone: formattedPhone,
-          provider: 'fast2sms',
-          purpose,
-          backendToken: fastData.token,
-          createdAt: Date.now()
-        });
-        console.log(`[Phone Auth] Fast pan-India DLT SMS dispatched via ${fastData.provider || 'fast2sms'} for ${formattedPhone}`);
-        return {
-          success: true,
-          formattedPhone,
-          provider: 'fast2sms',
-          message: `OTP verification code sent to ${formattedPhone}. Enter the 6-digit code below.`
-        };
-      }
-      if (
-        shouldStopOnFastSmsResponse({
-          status: fastResp.status,
-          error: fastData?.error,
-          fallbackToFirebase: fastData?.fallbackToFirebase
-        })
-      ) {
-        return {
-          success: false,
-          formattedPhone,
-          error: fastData.error
-        };
-      }
-      if (fastResp.status === 429) {
-        console.warn('[Phone Auth] Fast SMS gateway returned HTTP 429; falling through to Firebase:', fastData?.error || 'rate limited');
-      } else if (fastData?.error && !fastData?.smsNotConfigured) {
-        console.warn('[Phone Auth] Fast SMS gateway fell back to Firebase:', fastData.error);
-      }
-    } catch (fastErr) {
-      if (
-        fastAborted ||
-        controller.signal.aborted ||
-        (fastErr as { name?: string } | null)?.name === 'AbortError'
-      ) {
-        fastSmsMayHaveSent = true;
-        fastSmsMayHaveSentPhone = digits;
-        console.warn(
-          '[Phone Auth] Fast SMS request aborted (outcome unknown); marking fastSmsMayHaveSent=true and falling through to Firebase.'
-        );
-      } else {
-        console.debug('[Phone Auth] Fast SMS route unavailable, continuing with Firebase Phone Auth:', fastErr);
-      }
-    } finally {
-      clearTimeout(fastTimer);
-    }
-  } else {
-    console.log(`[Phone Auth] forceProvider='firebase' requested; skipping Fast2SMS for ${formattedPhone}.`);
-  }
-
-  if (requestSeq !== activeSendRequestSeq) {
-    return { success: false, formattedPhone, error: 'OTP request superseded by a newer attempt.' };
-  }
 
   // 1. Native Android & iOS Capacitor Platform Phone Auth (Firebase Native SDK + Play Integrity)
   if (Capacitor.isNativePlatform()) {
@@ -1005,7 +873,6 @@ export async function sendFirebasePhoneOtp(
               provider: 'firebase',
               purpose,
               verificationId: event.verificationId,
-              ...(fastSmsMayHaveSent ? { fastSmsMayHaveSent: true } : {}),
               createdAt: Date.now()
             });
           }
@@ -1048,7 +915,7 @@ export async function sendFirebasePhoneOtp(
             resolve({
               success: false,
               formattedPhone,
-              error: 'Timed out waiting for SMS dispatch. Please check your mobile signal and try again.'
+              error: `Timed out waiting for SMS dispatch. ${OTP_TIMEOUT_HINT}`
             });
           }
         }, 120000);
@@ -1132,7 +999,7 @@ export async function sendFirebasePhoneOtp(
       new Promise<never>((_, reject) => {
         timeoutHandle = setTimeout(() => {
           const timeoutErr: any = new Error(
-            'Verification timed out waiting for Google reCAPTCHA / Firebase SMS. Please check your connection or disable ad-blockers and try again.'
+            `Verification timed out waiting for Google reCAPTCHA / Firebase SMS. ${OTP_TIMEOUT_HINT}`
           );
           timeoutErr.code = 'auth/network-request-failed';
           reject(timeoutErr);
@@ -1177,6 +1044,17 @@ export async function sendFirebasePhoneOtp(
     console.warn('[Firebase Phone Auth] Web SDK primary attempt failed:', webErr);
     resetRecaptchaVerifier(targetContainerId);
 
+    const initialDiag = formatFirebasePhoneError(webErr);
+    if (isRateLimitErrorCode(initialDiag.code)) {
+      return {
+        success: false,
+        formattedPhone,
+        isRateLimited: true,
+        error: initialDiag.userMessage,
+        diagnostic: initialDiag
+      };
+    }
+
     // Self-heal immediately if a stale/prewarmed widget threw "already been rendered in this element"
     if (isRecaptchaAlreadyRenderedError(webErr)) {
       try {
@@ -1194,12 +1072,13 @@ export async function sendFirebasePhoneOtp(
     const errCode = String(webErr?.code || '');
     const errMsg = String(webErr?.message || '').toLowerCase();
     const isDomainOrCaptchaErr =
-      errCode === 'auth/unauthorized-domain' ||
-      errCode === 'auth/captcha-check-failed' ||
-      errCode === 'auth/invalid-app-credential' ||
-      errCode === 'auth/internal-error' ||
-      errMsg.includes('hostname match not found') ||
-      errMsg.includes('recaptcha');
+      !isRateLimitErrorCode(errCode) &&
+      (errCode === 'auth/unauthorized-domain' ||
+        errCode === 'auth/captcha-check-failed' ||
+        errCode === 'auth/invalid-app-credential' ||
+        errCode === 'auth/internal-error' ||
+        errMsg.includes('hostname match not found') ||
+        errMsg.includes('recaptcha'));
 
     const canFallbackAuthDomain = shouldAllowFallbackFirebaseAuthDomain({
       isNativePlatform: Capacitor.isNativePlatform(),
@@ -1249,34 +1128,6 @@ export interface VerifyFirebaseOtpResult {
   error?: string;
 }
 
-async function tryVerifyAmbiguousFast2SmsOtp(
-  phoneDigits: string,
-  otp: string
-): Promise<{ verified: boolean; sessionToken?: string }> {
-  try {
-    const resp = await fetch(apiUrl('/api/auth/verify-phone-otp'), {
-      method: 'POST',
-      credentials: 'include',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        phone: phoneDigits,
-        otp
-      })
-    });
-    const verifyData = await resp.json().catch(() => null);
-    if (resp.ok && verifyData?.success) {
-      return {
-        verified: true,
-        sessionToken: typeof verifyData.sessionToken === 'string' ? verifyData.sessionToken : undefined
-      };
-    }
-    return { verified: false };
-  } catch (fallbackErr) {
-    console.debug('[Phone Auth] Ambiguous Fast2SMS verify fallback failed:', fallbackErr);
-    return { verified: false };
-  }
-}
-
 /**
  * Verifies the 6-digit OTP code directly using Firebase Auth confirmation result or Native Android plugin,
  * then bridges the authenticated Firebase phone identity into the EXACT SAME Supabase account and user session!
@@ -1294,8 +1145,8 @@ export async function verifyFirebaseOtpAndBridgeToSupabase(
     };
   }
 
-  // Hydrate persisted verificationId / backendToken if WebView restarted after RecaptchaActivity
-  if (!activeNativeVerificationId && !activeConfirmationResult && !activeBackendOtpToken) {
+  // Hydrate persisted verificationId if WebView restarted after RecaptchaActivity
+  if (!activeNativeVerificationId && !activeConfirmationResult) {
     getPendingPhoneOtpSession();
   }
 
@@ -1326,41 +1177,14 @@ export async function verifyFirebaseOtpAndBridgeToSupabase(
     } catch (err: any) {
       console.error('[Native Firebase Phone Auth] OTP confirmation failed:', err);
       const diagnostic = formatFirebasePhoneError(err);
-      if (
-        shouldRetryFast2SmsVerifyAfterFirebaseFailure({
-          firebaseErrorCode: diagnostic.code,
-          fastSmsMayHaveSent,
-          fastSmsMayHaveSentPhone,
-          targetPhone: verifiedPhoneNumber
-        })
-      ) {
-        fastSmsMayHaveSent = false;
-        fastSmsMayHaveSentPhone = null;
-        const clean10 = verifiedPhoneNumber.replace(/\D/g, '').slice(-10);
-        const fallbackVerify = await tryVerifyAmbiguousFast2SmsOtp(clean10, cleanCode);
-        if (fallbackVerify.verified) {
-          if (fallbackVerify.sessionToken) {
-            setServerAuthToken(fallbackVerify.sessionToken);
-          }
-          clearPendingPhoneOtpSession();
-          clearNativePhoneListeners();
-          console.log('[Phone Auth] Verified late-arriving Fast2SMS OTP after native Firebase code mismatch.');
-        } else {
-          return {
-            success: false,
-            error: diagnostic.userMessage || err?.message || 'Invalid 6-digit verification code. Please check and try again.'
-          };
-        }
-      } else {
-        if (isExpiredOtpErrorCode(diagnostic.code)) {
-          clearPendingPhoneOtpSession();
-          clearNativePhoneListeners();
-        }
-        return {
-          success: false,
-          error: diagnostic.userMessage || err?.message || 'Invalid 6-digit verification code. Please check and try again.'
-        };
+      if (isExpiredOtpErrorCode(diagnostic.code)) {
+        clearPendingPhoneOtpSession();
+        clearNativePhoneListeners();
       }
+      return {
+        success: false,
+        error: diagnostic.userMessage || err?.message || 'Invalid 6-digit verification code. Please check and try again.'
+      };
     }
   } else if (activeConfirmationResult) {
     try {
@@ -1374,82 +1198,19 @@ export async function verifyFirebaseOtpAndBridgeToSupabase(
     } catch (err: any) {
       console.error('[Firebase Phone Auth] OTP verification failed:', err);
       const diagnostic = formatFirebasePhoneError(err);
-      if (
-        shouldRetryFast2SmsVerifyAfterFirebaseFailure({
-          firebaseErrorCode: diagnostic.code,
-          fastSmsMayHaveSent,
-          fastSmsMayHaveSentPhone,
-          targetPhone: verifiedPhoneNumber
-        })
-      ) {
-        fastSmsMayHaveSent = false;
-        fastSmsMayHaveSentPhone = null;
-        const clean10 = verifiedPhoneNumber.replace(/\D/g, '').slice(-10);
-        const fallbackVerify = await tryVerifyAmbiguousFast2SmsOtp(clean10, cleanCode);
-        if (fallbackVerify.verified) {
-          if (fallbackVerify.sessionToken) {
-            setServerAuthToken(fallbackVerify.sessionToken);
-          }
-          activeConfirmationResult = null;
-          clearPendingPhoneOtpSession();
-          resetRecaptchaVerifier();
-          console.log('[Phone Auth] Verified late-arriving Fast2SMS OTP after web Firebase code mismatch.');
-        } else {
-          return {
-            success: false,
-            error: 'Invalid 6-digit verification code. Please check and try again.'
-          };
-        }
-      } else {
-        if (isExpiredOtpErrorCode(diagnostic.code)) {
-          activeConfirmationResult = null;
-          clearPendingPhoneOtpSession();
-          resetRecaptchaVerifier();
-        }
-        return {
-          success: false,
-          error:
-            diagnostic.code === 'auth/invalid-verification-code'
-              ? 'Invalid 6-digit verification code. Please check and try again.'
-              : isExpiredOtpErrorCode(diagnostic.code)
-              ? 'Verification code has expired. Please request a new code.'
-              : diagnostic.userMessage || err?.message || 'Failed to verify OTP code with Firebase.'
-        };
+      if (isExpiredOtpErrorCode(diagnostic.code)) {
+        activeConfirmationResult = null;
+        clearPendingPhoneOtpSession();
+        resetRecaptchaVerifier();
       }
-    }
-  } else if (activeBackendOtpToken) {
-    try {
-      const resp = await fetch(apiUrl('/api/auth/verify-phone-otp'), {
-        method: 'POST',
-        credentials: 'include',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          phone: activeBackendOtpPhone || verifiedPhoneNumber,
-          otp: cleanCode,
-          token: activeBackendOtpToken,
-          fullName: userFullName
-        })
-      });
-      const verifyData = await resp.json().catch(() => null);
-      if (!resp.ok || !verifyData?.success) {
-        if (resp.status === 429 || verifyData?.expired) {
-          clearPendingPhoneOtpSession();
-        }
-        return {
-          success: false,
-          error: verifyData?.error || 'Invalid or expired OTP code.'
-        };
-      }
-      if (verifyData.sessionToken) {
-        setServerAuthToken(verifyData.sessionToken);
-      }
-      clearPendingPhoneOtpSession();
-      console.log('[Firebase Phone Auth] Successfully verified via server OTP session.');
-    } catch (err: any) {
-      console.error('[Firebase Phone Auth] Backend OTP verification error:', err);
       return {
         success: false,
-        error: err?.message || 'Failed to verify OTP with server.'
+        error:
+          diagnostic.code === 'auth/invalid-verification-code'
+            ? 'Invalid 6-digit verification code. Please check and try again.'
+            : isExpiredOtpErrorCode(diagnostic.code)
+            ? 'Verification code has expired. Please request a new code.'
+            : diagnostic.userMessage || err?.message || 'Failed to verify OTP code with Firebase.'
       };
     }
   } else {
@@ -1509,8 +1270,8 @@ export async function verifyPhoneOtpOnly(
     };
   }
 
-  // Hydrate persisted verificationId / backendToken if Android WebView restarted after RecaptchaActivity
-  if (!activeNativeVerificationId && !activeConfirmationResult && !activeBackendOtpToken) {
+  // Hydrate persisted verificationId if Android WebView restarted after RecaptchaActivity
+  if (!activeNativeVerificationId && !activeConfirmationResult) {
     getPendingPhoneOtpSession();
   }
 
@@ -1528,24 +1289,6 @@ export async function verifyPhoneOtpOnly(
     } catch (err: any) {
       console.error('[Native Firebase Phone Auth] Profile update OTP verification error:', err);
       const diagnostic = formatFirebasePhoneError(err);
-      if (
-        shouldRetryFast2SmsVerifyAfterFirebaseFailure({
-          firebaseErrorCode: diagnostic.code,
-          fastSmsMayHaveSent,
-          fastSmsMayHaveSentPhone,
-          targetPhone: parsedTarget.clean10
-        })
-      ) {
-        fastSmsMayHaveSent = false;
-        fastSmsMayHaveSentPhone = null;
-        const fallbackVerify = await tryVerifyAmbiguousFast2SmsOtp(parsedTarget.clean10, cleanCode);
-        if (fallbackVerify.verified) {
-          clearPendingPhoneOtpSession();
-          clearNativePhoneListeners();
-          console.log('[Phone Auth] Profile update verified late-arriving Fast2SMS OTP after native Firebase code mismatch.');
-          return { success: true, formattedPhone };
-        }
-      }
       if (isExpiredOtpErrorCode(diagnostic.code)) {
         clearPendingPhoneOtpSession();
         clearNativePhoneListeners();
@@ -1566,25 +1309,6 @@ export async function verifyPhoneOtpOnly(
     } catch (err: any) {
       console.error('[Firebase Phone Auth] Profile update OTP verification error:', err);
       const diagnostic = formatFirebasePhoneError(err);
-      if (
-        shouldRetryFast2SmsVerifyAfterFirebaseFailure({
-          firebaseErrorCode: diagnostic.code,
-          fastSmsMayHaveSent,
-          fastSmsMayHaveSentPhone,
-          targetPhone: parsedTarget.clean10
-        })
-      ) {
-        fastSmsMayHaveSent = false;
-        fastSmsMayHaveSentPhone = null;
-        const fallbackVerify = await tryVerifyAmbiguousFast2SmsOtp(parsedTarget.clean10, cleanCode);
-        if (fallbackVerify.verified) {
-          activeConfirmationResult = null;
-          clearPendingPhoneOtpSession();
-          resetRecaptchaVerifier();
-          console.log('[Phone Auth] Profile update verified late-arriving Fast2SMS OTP after web Firebase code mismatch.');
-          return { success: true, formattedPhone };
-        }
-      }
       if (isExpiredOtpErrorCode(diagnostic.code)) {
         activeConfirmationResult = null;
         clearPendingPhoneOtpSession();
@@ -1599,30 +1323,6 @@ export async function verifyPhoneOtpOnly(
             ? 'Verification code has expired. Please request a new code.'
             : diagnostic.userMessage || err?.message || 'Failed to verify OTP code.'
       };
-    }
-  } else if (activeBackendOtpToken) {
-    try {
-      const resp = await fetch(apiUrl('/api/auth/verify-phone-otp'), {
-        method: 'POST',
-        credentials: 'include',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          phone: activeBackendOtpPhone || formattedPhone,
-          otp: cleanCode,
-          token: activeBackendOtpToken
-        })
-      });
-      const verifyData = await resp.json().catch(() => null);
-      if (!resp.ok || !verifyData?.success) {
-        if (resp.status === 429 || verifyData?.expired) {
-          clearPendingPhoneOtpSession();
-        }
-        return { success: false, error: verifyData?.error || 'Invalid OTP code.' };
-      }
-      clearPendingPhoneOtpSession();
-      return { success: true, formattedPhone };
-    } catch (err: any) {
-      return { success: false, error: err?.message || 'Failed to verify OTP code.' };
     }
   }
 

@@ -944,12 +944,6 @@ export function decideEmailOtpVerificationOutcome(params: {
   };
 }
 
-export const SMS_OTP_IP_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
-export const SMS_OTP_IP_MAX = 30;
-export const SMS_OTP_PHONE_WINDOW_MS = 30 * 60 * 1000; // 30 minutes
-export const SMS_OTP_PHONE_MAX = 5;
-export const FAST2SMS_DISPATCH_TIMEOUT_MS = 5000;
-
 /**
  * Extracts the trusted client IP from Express `req.ip` (computed by Express using
  * `app.set("trust proxy", 1)`). Never reads the spoofable first `x-forwarded-for` entry.
@@ -965,43 +959,6 @@ export function resolveTrustedClientIp(req: {
   const socketIp =
     typeof req?.socket?.remoteAddress === "string" ? req.socket.remoteAddress.trim() : "";
   return socketIp || "127.0.0.1";
-}
-
-/**
- * Normalizes a 10-digit Indian mobile number from `req.body.phone` (falling back to
- * `req.query.phone` so callers cannot bypass body rate limiting via query strings).
- * Returns an empty string if no valid 10-digit Indian mobile number is present.
- */
-export function extractSmsOtpPhoneKey(req: {
-  body?: Record<string, any> | null;
-  query?: Record<string, any> | null;
-}): string {
-  const rawPhone = (req?.body && req.body.phone) ?? req?.query?.phone ?? "";
-  const digits = String(rawPhone || "").replace(/\D/g, "");
-  if (digits.length < 10) return "";
-  const clean10 = digits.slice(-10);
-  return /^[6-9]\d{9}$/.test(clean10) ? clean10 : "";
-}
-
-/**
- * Extracts safe diagnostic metadata (`request_id` and `message`) from a Fast2SMS
- * Dev API response for server logs without ever touching or logging an OTP code.
- */
-export function formatFast2SmsResponseLog(
-  data: Record<string, any> | null | undefined,
-  httpStatus: number
-): { requestId: string; message: string; ok: boolean; statusCode: number } {
-  const ok = data?.return === true;
-  const requestId =
-    typeof data?.request_id === "string" && data.request_id.trim()
-      ? data.request_id.trim()
-      : "none";
-  const rawMsg = Array.isArray(data?.message)
-    ? data.message.map((m) => String(m ?? "").trim()).filter(Boolean).join("; ")
-    : String(data?.message ?? "").trim();
-  const message = rawMsg || (ok ? "SMS accepted" : "No provider message");
-  const statusCode = Number(data?.status_code || httpStatus || (ok ? 200 : 502));
-  return { requestId, message, ok, statusCode };
 }
 
 /**

@@ -24,14 +24,7 @@ import {
   sanitizeRazorpayOrderNotes,
   evaluateRazorpayWebhookOrderUpdate,
   decideEmailOtpVerificationOutcome,
-  SMS_OTP_IP_WINDOW_MS,
-  SMS_OTP_IP_MAX,
-  SMS_OTP_PHONE_WINDOW_MS,
-  SMS_OTP_PHONE_MAX,
-  FAST2SMS_DISPATCH_TIMEOUT_MS,
   resolveTrustedClientIp,
-  extractSmsOtpPhoneKey,
-  formatFast2SmsResponseLog,
   resolveServerAuthSecret,
 } from "./orderSecurity";
 
@@ -816,56 +809,6 @@ test("resolveTrustedClientIp uses req.ip and ignores spoofable x-forwarded-for h
   assert.equal(resolveTrustedClientIp(reqWithSpoofedHeader), "203.0.113.45");
   assert.equal(resolveTrustedClientIp({ ip: "", socket: { remoteAddress: "198.51.100.9" } }), "198.51.100.9");
   assert.equal(resolveTrustedClientIp({ ip: null, socket: {} }), "127.0.0.1");
-});
-
-test("SMS OTP rate limiter constants and per-phone key extraction normalize variants and reject invalid numbers", () => {
-  assert.equal(SMS_OTP_IP_WINDOW_MS, 10 * 60 * 1000);
-  assert.equal(SMS_OTP_IP_MAX, 30);
-  assert.equal(SMS_OTP_PHONE_WINDOW_MS, 30 * 60 * 1000);
-  assert.equal(SMS_OTP_PHONE_MAX, 5);
-  assert.equal(FAST2SMS_DISPATCH_TIMEOUT_MS, 5000);
-
-  // All formatted variants of the same number map to the exact same 10-digit bucket
-  assert.equal(extractSmsOtpPhoneKey({ body: { phone: "9876543210" } }), "9876543210");
-  assert.equal(extractSmsOtpPhoneKey({ body: { phone: "+91 98765-43210" } }), "9876543210");
-  assert.equal(extractSmsOtpPhoneKey({ body: { phone: "09876543210" } }), "9876543210");
-  assert.equal(extractSmsOtpPhoneKey({ body: { phone: "919876543210" } }), "9876543210");
-  // Query-string fallback prevents bypassing req.body limiter via ?phone=...
-  assert.equal(extractSmsOtpPhoneKey({ body: {}, query: { phone: "9876543210" } }), "9876543210");
-
-  // Invalid / missing numbers return empty string so they skip per-phone bucketing and hit 400 validation
-  assert.equal(extractSmsOtpPhoneKey({ body: { phone: "12345" } }), "");
-  assert.equal(extractSmsOtpPhoneKey({ body: { phone: "1234567890" } }), "");
-  assert.equal(extractSmsOtpPhoneKey({ body: {} }), "");
-});
-
-test("formatFast2SmsResponseLog extracts request_id and message safely for every response", () => {
-  const okLog = formatFast2SmsResponseLog(
-    { return: true, request_id: "req_abc123", message: ["SMS sent successfully."] },
-    200
-  );
-  assert.deepEqual(okLog, {
-    requestId: "req_abc123",
-    message: "SMS sent successfully.",
-    ok: true,
-    statusCode: 200,
-  });
-
-  const failLog = formatFast2SmsResponseLog(
-    { return: false, status_code: 414, request_id: "req_err99", message: "IP is blacklisted" },
-    400
-  );
-  assert.deepEqual(failLog, {
-    requestId: "req_err99",
-    message: "IP is blacklisted",
-    ok: false,
-    statusCode: 414,
-  });
-
-  const emptyLog = formatFast2SmsResponseLog({}, 502);
-  assert.equal(emptyLog.ok, false);
-  assert.equal(emptyLog.requestId, "none");
-  assert.equal(emptyLog.statusCode, 502);
 });
 
 test("resolveServerAuthSecret fails fast in production when all three secrets are unset", () => {

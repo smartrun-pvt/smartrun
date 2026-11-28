@@ -63,14 +63,7 @@ import {
   sanitizeRazorpayOrderNotes,
   evaluateRazorpayWebhookOrderUpdate,
   decideEmailOtpVerificationOutcome,
-  SMS_OTP_IP_WINDOW_MS,
-  SMS_OTP_IP_MAX,
-  SMS_OTP_PHONE_WINDOW_MS,
-  SMS_OTP_PHONE_MAX,
-  FAST2SMS_DISPATCH_TIMEOUT_MS,
   resolveTrustedClientIp,
-  extractSmsOtpPhoneKey,
-  formatFast2SmsResponseLog,
   resolveServerAuthSecret
 } from "./src/utils/orderSecurity";
 
@@ -1920,37 +1913,6 @@ function requireApiSecret(req: express.Request, res: express.Response, next: exp
   next();
 }
 
-// smsOtpLimiter: 30 OTP requests per 10 minutes per IP (accounts for carrier CGNAT shared IPs)
-const smsOtpLimiter = rateLimit({
-  windowMs: SMS_OTP_IP_WINDOW_MS,
-  max: SMS_OTP_IP_MAX,
-  standardHeaders: true,
-  legacyHeaders: false,
-  validate: { xForwardedForHeader: false, forwardedHeader: false, default: false },
-  keyGenerator: getClientIp,
-  message: {
-    success: false,
-    fallbackToFirebase: true,
-    error: "Too many SMS requests from this network. Please wait a few minutes before trying again."
-  }
-});
-
-// smsOtpPhoneLimiter: 5 OTP sends per 30 minutes per 10-digit phone number
-const smsOtpPhoneLimiter = rateLimit({
-  windowMs: SMS_OTP_PHONE_WINDOW_MS,
-  max: SMS_OTP_PHONE_MAX,
-  standardHeaders: true,
-  legacyHeaders: false,
-  validate: { xForwardedForHeader: false, forwardedHeader: false, default: false },
-  skip: (req) => !extractSmsOtpPhoneKey(req),
-  keyGenerator: (req) => `phone:${extractSmsOtpPhoneKey(req) || getClientIp(req)}`,
-  message: {
-    success: false,
-    fallbackToFirebase: true,
-    error: "Too many SMS requests for this mobile number. Switching to backup verification."
-  }
-});
-
 // otpVerifyLimiter: 20 OTP verification attempts per 10 minutes per IP to block automated brute-force guessing
 const otpVerifyLimiter = rateLimit({
   windowMs: 10 * 60 * 1000,
@@ -2046,9 +2008,6 @@ function maskPhoneNumber(phone: string): string {
   if (digits.length < 4) return "******";
   return `+91 ******${digits.slice(-4)}`;
 }
-
-// In-memory per-phone cooldown tracker to prevent SMS bombing on a single phone number
-const phoneLastSmsSentTime = new Map<string, number>();
 
 // Helper to retrieve the authenticated user from Supabase Bearer token
 async function getAuthenticatedUser(req: express.Request): Promise<any | null> {
@@ -8458,25 +8417,8 @@ Knowledge Base & Service Details:
 
 
   // =========================================================================
-  // BACKEND FIREBASE PHONE AUTH & OTP VERIFICATION
+  // BACKEND FIREBASE PHONE AUTH & PROFILE RESOLUTION
   // =========================================================================
-  interface ServerPhoneOtpEntry {
-    otp: string;
-    expiresAt: number;
-    attempts: number;
-    phone: string;
-  }
-  const serverPhoneOtpStore = new Map<string, ServerPhoneOtpEntry>();
-
-  // Clean expired OTPs every 5 minutes
-  setInterval(() => {
-    const now = Date.now();
-    for (const [phone, entry] of serverPhoneOtpStore.entries()) {
-      if (entry.expiresAt < now) {
-        serverPhoneOtpStore.delete(phone);
-      }
-    }
-  }, 5 * 60 * 1000);
 
   /**
    * Helper: Resolves existing user profile by 10-digit phone number
@@ -8924,386 +8866,6 @@ Knowledge Base & Service Details:
       return res.json({ success: true, message: "Logged out from server session." });
     } catch (err: any) {
       return res.status(500).json({ success: false, error: err?.message || "Logout error." });
-    }
-  });
-
-  // Per-phone / per-token OTP verification attempt cap & consumed HMAC token replay guard
-  const otpVerifyFailureTracker = new Map<string, { attempts: number; resetAt: number }>();
-  const consumedOtpTokens = new Map<string, number>();
-
-  const pruneOtpVerifyGuards = (now: number) => {
-    if (otpVerifyFailureTracker.size > 500) {
-      for (const [key, val] of otpVerifyFailureTracker.entries()) {
-        if (val.resetAt <= now) otpVerifyFailureTracker.delete(key);
-      }
-    }
-    if (consumedOtpTokens.size > 500) {
-      for (const [key, exp] of consumedOtpTokens.entries()) {
-        if (exp <= now) consumedOtpTokens.delete(key);
-      }
-    }
-  };
-
-  /**
-   * Fast Pan-India DLT SMS OTP Dispatch Endpoint (Fast2SMS Dev API bulkV2)
-   * Dispatches real transactional OTP SMS in 2-5 seconds across ALL 22 Indian telecom circles
-   * (including DND and non-Kolkata circles) without Firebase reCAPTCHA or *.firebaseapp.com SMS domain.
-   * If FAST2SMS_API_KEY is not configured or delivery fails, returns fallbackToFirebase: true
-   * and NEVER fabricates a fake success response.
-   * POST /api/auth/send-phone-otp
-   * Request Body: { phone: "9876543210" }
-   */
-  app.post("/api/auth/send-phone-otp", smsOtpLimiter, smsOtpPhoneLimiter, async (req, res) => {
-    try {
-      const rawPhone = (req.body && req.body.phone) || req.query?.phone || "";
-      const cleanPhone = String(rawPhone || "").replace(/\D/g, "").slice(-10);
-      if (cleanPhone.length !== 10 || !/^[6-9]\d{9}$/.test(cleanPhone)) {
-        return res.status(400).json({
-          success: false,
-          error: "Please enter a valid 10-digit Indian mobile number."
-        });
-      }
-
-      const fast2smsApiKey = String(process.env.FAST2SMS_API_KEY || "").trim();
-      if (!fast2smsApiKey) {
-        return res.status(503).json({
-          success: false,
-          fallbackToFirebase: true,
-          smsNotConfigured: true,
-          error: "Fast pan-India SMS gateway (FAST2SMS_API_KEY) is not configured on the server."
-        });
-      }
-
-      // Enforce 5-second cooldown per phone number
-      const lastSent = phoneLastSmsSentTime.get(cleanPhone) || 0;
-      const now = Date.now();
-      if (now - lastSent < 5000) {
-        const remainingSec = Math.ceil((5000 - (now - lastSent)) / 1000);
-        return res.status(429).json({
-          success: false,
-          fallbackToFirebase: true,
-          error: `Please wait ${remainingSec} seconds before requesting another verification code.`
-        });
-      }
-
-      // Generate secure 6-digit OTP
-      const generatedOtp = crypto.randomInt(100000, 1000000).toString();
-      const expiresAt = Date.now() + 10 * 60 * 1000;
-
-      // Helper to dispatch via Fast2SMS Dev API v2 with strict 5000ms timeout
-      const dispatchFast2Sms = async (payload: Record<string, string>) => {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), FAST2SMS_DISPATCH_TIMEOUT_MS);
-        try {
-          const upstream = await fetch("https://www.fast2sms.com/dev/bulkV2", {
-            method: "POST",
-            headers: {
-              authorization: fast2smsApiKey,
-              "Content-Type": "application/json",
-              accept: "application/json",
-            },
-            body: JSON.stringify(payload),
-            signal: controller.signal,
-          });
-          const data = await upstream.json().catch(() => ({}));
-          return { httpStatus: upstream.status, data };
-        } finally {
-          clearTimeout(timer);
-        }
-      };
-
-      // Strictly use Fast2SMS dedicated pre-approved DLT 'otp' route (pan-India, DND-safe).
-      // No 'q' route fallback (blocked on DND numbers and higher cost); fall back to Firebase on failure.
-      const smsResponse = await dispatchFast2Sms({
-        route: "otp",
-        variables_values: generatedOtp,
-        numbers: cleanPhone,
-        flash: "0",
-      });
-      const usedRoute: "otp" = "otp";
-
-      const fast2SmsLog = formatFast2SmsResponseLog(smsResponse.data, smsResponse.httpStatus);
-      console.log(
-        `[Fast2SMS OTP] Send response (http=${smsResponse.httpStatus}, ok=${fast2SmsLog.ok}, request_id=${fast2SmsLog.requestId}, message=${fast2SmsLog.message})`
-      );
-
-      if (!fast2SmsLog.ok) {
-        const statusCode = fast2SmsLog.statusCode;
-        const providerMsg = fast2SmsLog.message || "SMS gateway rejected request.";
-        console.warn(`[Fast2SMS OTP] Delivery failed (code=${statusCode}, request_id=${fast2SmsLog.requestId}): ${providerMsg}`);
-        return res.status(502).json({
-          success: false,
-          fallbackToFirebase: true,
-          errorCode: statusCode,
-          error:
-            statusCode === 414
-              ? "Fast2SMS Dev API blocked server IP (414). Whitelist server IP or disable IP whitelist in Fast2SMS Security settings."
-              : providerMsg,
-        });
-      }
-
-      phoneLastSmsSentTime.set(cleanPhone, now);
-
-      // Cryptographic HMAC token valid across serverless cold starts
-      const secret = (process.env.SESSION_SECRET || process.env.SUPABASE_SERVICE_ROLE_KEY || SERVER_AUTH_SECRET).slice(0, 32);
-      const signature = crypto
-        .createHmac("sha256", secret)
-        .update(`${cleanPhone}:${generatedOtp}:${expiresAt}`)
-        .digest("hex");
-      const token = `${expiresAt}.${signature}`;
-
-      serverPhoneOtpStore.set(cleanPhone, {
-        otp: generatedOtp,
-        expiresAt,
-        attempts: 0,
-        phone: cleanPhone
-      });
-      otpVerifyFailureTracker.delete(`ph:${cleanPhone}`);
-
-      // Log verification dispatch to Firebase Firestore on backend (non-blocking)
-      if (serverFirestore) {
-        const verificationRef = firestoreDoc(serverFirestore, "phone_otps", cleanPhone);
-        firestoreSetDoc(verificationRef, {
-          phone: `+91${cleanPhone}`,
-          created_at: new Date().toISOString(),
-          status: "sent",
-          provider: `fast2sms_${usedRoute}`
-        }, { merge: true }).catch(() => {});
-      }
-
-      console.log(
-        `[Fast2SMS OTP] Dispatched pan-India SMS (${usedRoute}) to +91 ${cleanPhone.slice(0, 4)}**** (request_id=${fast2SmsLog.requestId})`
-      );
-
-      return res.json({
-        success: true,
-        delivered: true,
-        phone: cleanPhone,
-        formattedPhone: `+91${cleanPhone}`,
-        token,
-        provider: "fast2sms",
-        route: usedRoute,
-        message: `OTP sent to +91 ${cleanPhone}.`
-      });
-    } catch (err: any) {
-      const isTimeout = err?.name === "AbortError";
-      console.warn("[Fast2SMS OTP] Exception:", err?.message || err);
-      return res.status(502).json({
-        success: false,
-        fallbackToFirebase: true,
-        error: isTimeout
-          ? "SMS gateway timed out. Switching to backup OTP delivery."
-          : err?.message || "Failed to dispatch SMS verification code."
-      });
-    }
-  });
-
-  /**
-   * Backend Phone OTP Verification Endpoint
-   * Verifies OTP and synchronizes user profile to Firebase Firestore on backend server
-   * POST /api/auth/verify-phone-otp
-   * Request Body: { phone: "9876543210", otp: "123456", token?: "...", fullName?: "..." }
-   */
-  app.post("/api/auth/verify-phone-otp", otpVerifyLimiter, async (req, res) => {
-    try {
-      const { phone, otp, token, fullName } = req.body || {};
-      const cleanPhone = String(phone || "").replace(/\D/g, "").slice(-10);
-      const cleanOtp = String(otp || "").replace(/\D/g, "").trim();
-
-      if (!cleanPhone || cleanPhone.length !== 10 || !/^[6-9]\d{9}$/.test(cleanPhone)) {
-        return res.status(400).json({ success: false, error: "Invalid phone number." });
-      }
-      if (!cleanOtp || cleanOtp.length !== 6) {
-        return res.status(400).json({ success: false, error: "Please enter a valid 6-digit OTP." });
-      }
-
-      const now = Date.now();
-      pruneOtpVerifyGuards(now);
-
-      const tokenStr = typeof token === "string" ? token.trim() : "";
-      const tokenHashKey = tokenStr
-        ? `tok:${crypto.createHash("sha256").update(tokenStr).digest("hex").slice(0, 24)}`
-        : "";
-      const phoneFailKey = `ph:${cleanPhone}`;
-
-      // Reject immediately if this HMAC token was already consumed (prevents replay attacks)
-      if (tokenHashKey) {
-        const consumedExp = consumedOtpTokens.get(tokenHashKey);
-        if (consumedExp && consumedExp > now) {
-          return res.status(400).json({
-            success: false,
-            expired: true,
-            error: "This verification code has already been used. Please request a new OTP."
-          });
-        }
-      }
-
-      // Enforce 5-attempt cap BEFORE checking HMAC or store to defeat brute-force guessing
-      const phoneFailures = otpVerifyFailureTracker.get(phoneFailKey);
-      const tokenFailures = tokenHashKey ? otpVerifyFailureTracker.get(tokenHashKey) : undefined;
-      if (
-        (phoneFailures && phoneFailures.resetAt > now && phoneFailures.attempts >= 5) ||
-        (tokenFailures && tokenFailures.resetAt > now && tokenFailures.attempts >= 5)
-      ) {
-        serverPhoneOtpStore.delete(cleanPhone);
-        return res.status(429).json({
-          success: false,
-          expired: true,
-          error: "Too many incorrect OTP attempts. Please request a fresh verification code."
-        });
-      }
-
-      const secrets = [
-        (process.env.SESSION_SECRET || process.env.SUPABASE_SERVICE_ROLE_KEY || SERVER_AUTH_SECRET).slice(0, 32),
-      ].filter(Boolean);
-      let isCodeValid = false;
-      let isCodeExpired = false;
-      let matchedTokenExpiresAt = 0;
-
-      // 1. Check test OTP codes (strictly restricted: only allowed in non-production on dedicated virtual sandbox number 9999900000)
-      const isNonProd = process.env.NODE_ENV !== "production" && process.env.NODE_ENV !== "prod";
-      if (isNonProd && (cleanOtp === "123456" || cleanOtp === "582914") && cleanPhone === "9999900000") {
-        isCodeValid = true;
-      }
-
-      // 2. Check cryptographic HMAC token with constant-time comparison
-      if (!isCodeValid && tokenStr && tokenStr.includes(".")) {
-        const parts = tokenStr.split(".");
-        const expiresAt = Number(parts[0]);
-        const sig = parts[1] || "";
-        if (!isNaN(expiresAt) && expiresAt > 0) {
-          if (now > expiresAt) {
-            isCodeExpired = true;
-          } else if (sig && /^[a-f0-9]{64}$/i.test(sig)) {
-            const sigBuf = Buffer.from(sig.toLowerCase(), "hex");
-            for (const sec of secrets) {
-              const expectedBuf = crypto
-                .createHmac("sha256", sec)
-                .update(`${cleanPhone}:${cleanOtp}:${expiresAt}`)
-                .digest();
-              if (sigBuf.length === expectedBuf.length && crypto.timingSafeEqual(sigBuf, expectedBuf)) {
-                isCodeValid = true;
-                matchedTokenExpiresAt = expiresAt;
-                break;
-              }
-            }
-          }
-        }
-      }
-
-      // 3. Check server in-memory OTP store
-      if (!isCodeValid) {
-        const entry = serverPhoneOtpStore.get(cleanPhone);
-        if (entry) {
-          if (entry.expiresAt < now) {
-            isCodeExpired = true;
-            serverPhoneOtpStore.delete(cleanPhone);
-          } else {
-            entry.attempts += 1;
-            const entryBuf = Buffer.from(String(entry.otp), "utf-8");
-            const inputBuf = Buffer.from(cleanOtp, "utf-8");
-            if (
-              entry.attempts <= 5 &&
-              entryBuf.length === inputBuf.length &&
-              crypto.timingSafeEqual(entryBuf, inputBuf)
-            ) {
-              isCodeValid = true;
-              serverPhoneOtpStore.delete(cleanPhone);
-            } else if (entry.attempts >= 5) {
-              isCodeExpired = true;
-              serverPhoneOtpStore.delete(cleanPhone);
-            }
-          }
-        }
-      }
-
-      if (!isCodeValid) {
-        const windowResetAt = now + 10 * 60 * 1000;
-        const nextPhoneAttempts = (phoneFailures && phoneFailures.resetAt > now ? phoneFailures.attempts : 0) + 1;
-        otpVerifyFailureTracker.set(phoneFailKey, {
-          attempts: nextPhoneAttempts,
-          resetAt: phoneFailures && phoneFailures.resetAt > now ? phoneFailures.resetAt : windowResetAt
-        });
-        if (tokenHashKey) {
-          const nextTokenAttempts = (tokenFailures && tokenFailures.resetAt > now ? tokenFailures.attempts : 0) + 1;
-          otpVerifyFailureTracker.set(tokenHashKey, {
-            attempts: nextTokenAttempts,
-            resetAt: tokenFailures && tokenFailures.resetAt > now ? tokenFailures.resetAt : windowResetAt
-          });
-        }
-        const nowLocked = nextPhoneAttempts >= 5;
-        if (nowLocked) {
-          serverPhoneOtpStore.delete(cleanPhone);
-        }
-        return res.status(nowLocked ? 429 : 400).json({
-          success: false,
-          expired: isCodeExpired || nowLocked,
-          error: nowLocked
-            ? "Too many incorrect OTP attempts. Please request a fresh verification code."
-            : isCodeExpired
-              ? "This verification code has expired. Please tap Resend OTP for a new code."
-              : "Invalid or expired verification code. Please check the code and try again."
-        });
-      }
-
-      // Validated! Clear failure tracking, remove from in-memory store, and mark token consumed
-      serverPhoneOtpStore.delete(cleanPhone);
-      otpVerifyFailureTracker.delete(phoneFailKey);
-      if (tokenHashKey) {
-        otpVerifyFailureTracker.delete(tokenHashKey);
-        consumedOtpTokens.set(tokenHashKey, matchedTokenExpiresAt || now + 10 * 60 * 1000);
-      }
-
-      // Pre-resolve existing user account or create clean user profile
-      const existing = await resolvePhoneUser(cleanPhone);
-      const userId = existing?.user_id || `phone_${cleanPhone}`;
-      const userFullName = existing?.name || existing?.full_name || fullName || "Customer";
-      const userEmail = (existing?.email && !existing.email.includes("@girirajpower.internal")) ? existing.email : null;
-      const userRole: "customer" = "customer";
-
-      // Automatically sync user to Firebase Firestore on backend server
-      if (serverFirestore) {
-        syncUserToBackendFirestore(userId, {
-          phone: `+91${cleanPhone}`,
-          name: userFullName,
-          full_name: userFullName,
-          email: userEmail || ""
-        }).catch(() => {});
-      }
-
-      // Mint server-authoritative session
-      const sessionToken = createServerSessionToken({
-        uid: userId,
-        phone: `+91${cleanPhone}`,
-        email: userEmail,
-        name: userFullName,
-        role: userRole
-      });
-
-      // Set httpOnly cookie for web browsers
-      setServerSessionCookie(req, res, sessionToken);
-
-      return res.json({
-        success: true,
-        verified: true,
-        phone: `+91${cleanPhone}`,
-        cleanPhone,
-        userId,
-        sessionToken,
-        profile: existing || {
-          id: userId,
-          phone: `+91${cleanPhone}`,
-          name: userFullName,
-          email: userEmail,
-          role: userRole
-        },
-        message: "Phone number verified successfully."
-      });
-    } catch (err: any) {
-      return res.status(500).json({
-        success: false,
-        error: err?.message || "Internal error verifying OTP."
-      });
     }
   });
 
@@ -11152,16 +10714,10 @@ Knowledge Base & Service Details:
     return res.json({ success: true, message: "Passkey removed." });
   });
 
-  // Phone Auth Gateway Status Endpoint (Fast2SMS Pan-India DLT + Firebase Fallback)
+  // Phone Auth Gateway Status Endpoint (Firebase Phone Auth Only)
   app.get("/api/sms/providers-status", (req, res) => {
-    const fast2smsConfigured = Boolean(String(process.env.FAST2SMS_API_KEY || "").trim());
     return res.json({
-      gateway: fast2smsConfigured ? "fast2sms_primary_firebase_fallback" : "firebase_only",
-      fast2sms: {
-        configured: fast2smsConfigured,
-        primaryRoute: "otp",
-        panIndiaDlt: true
-      },
+      gateway: "firebase_only",
       firebase: {
         type: "firebase_phone_auth",
         status: "active",
@@ -11194,29 +10750,17 @@ Knowledge Base & Service Details:
 
   /**
    * Supabase Custom SMS Hook Endpoint
-   * Used when Supabase Auth -> Hooks -> Send SMS is configured
+   * Phone OTP is handled exclusively by Firebase Phone Auth.
    */
   app.post("/api/supabase-sms-hook", async (req, res) => {
     try {
       const body = req.body || {};
       const phone = body.sms?.phone || body.phone || body.user?.phone || "";
-      const otp = body.sms?.otp || body.otp || "";
-
-      if (!phone || !otp) {
+      if (!phone) {
         return res.status(400).json({
-          error: "Missing required phone or otp parameters from Supabase SMS hook."
+          error: "Missing required phone parameter from Supabase SMS hook."
         });
       }
-
-      const cleanPhone = String(phone).replace(/\D/g, "").slice(-10);
-      serverPhoneOtpStore.set(cleanPhone, {
-        otp: String(otp).trim(),
-        expiresAt: Date.now() + 10 * 60 * 1000,
-        attempts: 0,
-        phone: cleanPhone
-      });
-
-      console.log(`[Firebase Backend Hook] Registered OTP for +91 ${cleanPhone.slice(0, 4)}****`);
       return res.status(200).json({});
     } catch (err: any) {
       console.error("[Firebase Backend Hook] Unexpected failure:", err);
